@@ -1,0 +1,36 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "upd-to-cvat-xml"
+version     = "0.1.0"
+description = "Export IDAH datasets from UPD files into CVAT 1.1 annotation packages."
+readme      = "README.md"
+license     = { text = "MIT" }
+requires-python = ">=3.14"
+
+keywords = ["upd", "cvat", "annotation", "dataset", "export"]
+
+# The `upd` SDK is installed straight from its public GitHub repo (it is not
+# published to PyPI). For local side-by-side development install it editable
+# instead — see the README.
+dependencies = [
+    "upd @ git+https://github.com/idah-ai/upd-sdk-python.git",
+    "numpy>=2.0",
+    "pyflubber>=0.1.2",   # flubber-equivalent polygon morphing (see interpolation.py)
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+upd-to-cvat = "upd_to_cvat.cli:main"
+
+[project.urls]
+"Homepage"    = "https://github.com/idah-ai/upd-to-cvat-xml"
+"Bug Tracker" = "https://github.com/idah-ai/upd-to-cvat-xml/issues"
+
+[tool.setuptools.packages.find]
+where   = ["src"]
+include = ["upd_to_cvat*"]
