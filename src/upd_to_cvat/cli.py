@@ -21,6 +21,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "interpolate between them, instead of materialising "
                         "every frame. Smaller files; bboxes identical, but "
                         "polygon interpolation will differ from the frontend.")
+    p.add_argument("--no-clamp", dest="clamp", action="store_false",
+                   help="Disable clamping shapes to the image/frame bounds. By "
+                        "default every point is clipped into [0, width] × "
+                        "[0, height] since IDAH normalised points can drift "
+                        "outside [0, 1]; pass this to keep the raw coordinates.")
     p.add_argument("--dataset", default=None, help="Optional dataset-id filter.")
     return p
 
@@ -29,7 +34,7 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     run(args.upd, args.output,
         with_images=args.with_images, dataset_filter=args.dataset,
-        keyframes_only=args.keyframes_only)
+        keyframes_only=args.keyframes_only, clamp=args.clamp)
 
 
 if __name__ == "__main__":

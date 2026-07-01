@@ -1,13 +1,14 @@
 # upd-to-cvat-xml
 
-Export IDAH datasets stored in [UPD](https://github.com/idah-ai/upd-sdk-python)
+Convert IDAH datasets stored in [UPD](https://github.com/idah-ai/upd-sdk-python)
 files into [CVAT 1.1](https://opencv.github.io/cvat/docs/manual/advanced/xml_format/)
-annotation packages. The output format is chosen per dataset `modality`:
+annotation packages. The output format is selected automatically per dataset
+`modality`:
 
-- **`idah-video`** → *CVAT for video 1.1*. Each entry is one video → **one CVAT
-  task folder** per entry, with `<track>`s.
-- **`idah-image`** → *CVAT for images 1.1*. The whole dataset is **one task**,
-  with one `<image>` per entry.
+- **`idah-video`** → *CVAT for video 1.1*: one CVAT task folder per video entry,
+  with annotation tracks.
+- **`idah-image`** → *CVAT for images 1.1*: the whole dataset as a single task,
+  with one image per entry.
 
 ```
 # idah-video
@@ -19,50 +20,29 @@ cvat-export/<dataset>/annotations.xml
                       images/<name>.jpg                            # --with-images
 ```
 
-Supported shapes: bounding-box, polygon (both); plus ellipse and line
-(→ CVAT `polyline`) for images.
+Supported shapes: bounding box and polygon (video and images); plus ellipse,
+circle, and line for images.
 
 ---
 
 ## Requirements
 
 - **Python ≥ 3.14**
-- **ffmpeg / ffprobe** on `PATH`. CVAT XML uses absolute pixel coordinates, so
-  every video/image is probed with `ffprobe` for its dimensions (and frame
-  count, for video) — required even without `--with-images`. (`brew install
-  ffmpeg` / `apt-get install ffmpeg`.)
-- The [`upd`](https://github.com/idah-ai/upd-sdk-python) SDK (pulled from its
-  public GitHub repo over HTTPS).
+- **ffmpeg / ffprobe** available on `PATH`. CVAT XML uses absolute pixel
+  coordinates, so every video and image is probed for its dimensions (and frame
+  count, for video) — required even without `--with-images`.
+  (`brew install ffmpeg` / `apt-get install ffmpeg`.)
 
 ## Installation
 
-The `upd` SDK is not on PyPI — it is pulled directly from its public GitHub
-repo over HTTPS, which is declared as a dependency in `pyproject.toml`. From a
-fresh virtual environment:
+The [`upd`](https://github.com/idah-ai/upd-sdk-python) SDK is not on PyPI; it is
+declared as a dependency and pulled from its public GitHub repository over HTTPS.
+From a fresh virtual environment:
 
 ```bash
 python3.14 -m venv .venv
 source .venv/bin/activate
-pip install .                 # installs this package + upd from git (HTTPS)
-```
-
-This resolves `upd @ git+https://github.com/idah-ai/upd-sdk-python.git`. If you
-have SSH set up and prefer it, install the SDK that way first, then this
-package:
-
-```bash
-pip install "upd @ git+ssh://git@github.com/idah-ai/upd-sdk-python.git"
-pip install .
-```
-
-### Local development (editable, side-by-side)
-
-If you have both repos checked out next to each other and want to hack on the
-SDK at the same time, install it editable instead of from git:
-
-```bash
-pip install -e ../upd-sdk-python   # editable SDK checkout
-pip install -e .                   # this package, editable
+pip install .                 # installs this package + the upd SDK from git
 ```
 
 ## Usage
@@ -71,67 +51,28 @@ pip install -e .                   # this package, editable
 # annotations only
 upd-to-cvat --upd idah-export.upd --output cvat-export
 
-# also extract every frame as PNG (needs ffmpeg)
+# also extract every video frame as PNG (needs ffmpeg)
 upd-to-cvat --upd idah-export.upd --output cvat-export --with-images
 
-# video: emit only IDAH keyframes, let CVAT interpolate between them
+# video: export only IDAH keyframes and let CVAT interpolate between them
 upd-to-cvat --upd idah-export.upd --output cvat-export --keyframes-only
 
-# limit to one dataset
+# limit to a single dataset
 upd-to-cvat --upd idah-export.upd --output cvat-export --dataset <dataset-id>
 ```
-
-Equivalent module form: `python -m upd_to_cvat --upd …`.
 
 | Flag              | Description                                                            |
 | ----------------- | --------------------------------------------------------------------- |
 | `--upd`           | Input UPD file (required).                                            |
 | `--output`        | Output root directory (default `cvat-export`).                        |
 | `--with-images`   | Video: extract frames as `images/frame_%06d.PNG`. Images: copy the source images into `images/`. (Requires `ffmpeg` for video.) |
-| `--keyframes-only`| Video: emit only the IDAH keyframes (each `keyframe="1"`) and let CVAT interpolate between them, instead of materialising every frame. Much smaller files. Bboxes are identical (both interpolate linearly); **polygons differ** — CVAT's polygon interpolation is not flubber, so in-between shapes won't match the frontend. No effect on images. |
-| `--dataset`       | Optional dataset-id filter.                                           |
+| `--keyframes-only`| Video: export only the IDAH keyframes and let CVAT interpolate between them, producing much smaller files. Bounding boxes are identical either way; polygon in-between shapes may differ from the frontend. No effect on images. |
+| `--no-clamp`      | Keep raw coordinates instead of clamping each shape to the media bounds. By default shapes are clipped to `[0, width] × [0, height]`, since normalised IDAH points can drift slightly outside `[0, 1]`. |
+| `--dataset`       | Optional dataset-id filter.                                          |
 
-## How the mapping works
+Equivalent module form: `python -m upd_to_cvat --upd …`.
 
-### idah-video → CVAT for video 1.1
-
-IDAH `idah-video` annotations are stored as
-`shape_args = {start, end, frames:[{frame, angle, points}]}` with **normalised
-`[0, 1]`** points and `annotation = {"category": <label>}`. These map onto CVAT
-`<track>`s:
-
-- each annotation → one `<track>` (`label` = category),
-- **every** frame in `[start, end]` is emitted as a `<box>` / `<polygon>`
-  (denormalised to absolute pixels using the probed video size). The shape at
-  each frame is computed with the [interpolation helper](#per-frame-interpolation)
-  — bbox linear, polygon via flubber — so the exported geometry matches the
-  frontend rather than relying on CVAT's own interpolation. Original IDAH
-  keyframes are flagged `keyframe="1"`, interpolated frames `keyframe="0"`,
-- a trailing `outside="1"` shape terminates the track (unless it runs to the
-  last video frame).
-
-Shape types: `idah-video:bounding-box` → `<box>`, `idah-video:polygon` →
-`<polygon>`. Unknown shape types are skipped with a warning.
-
-### idah-image → CVAT for images 1.1
-
-Each `idah-image` annotation is a single shape (no `frames`); `shape_args`
-holds normalised points (and an `angle` in **radians** for box/ellipse). The
-whole dataset becomes one task with one `<image>` per entry, denormalised to
-each image's probed size:
-
-| IDAH shape_type           | CVAT element | notes                                            |
-| ------------------------- | ------------ | ------------------------------------------------ |
-| `idah-image:bounding-box` | `<box>`      | `angle` (rad) → `rotation` (deg)                 |
-| `idah-image:polygon`      | `<polygon>`  |                                                  |
-| `idah-image:ellipse`      | `<ellipse>`  | `points = [[cx,cy],[rx,ry]]`; `angle` → rotation |
-| `idah-image:circle`       | `<ellipse>`  | treated as ellipse with equal radii (untested)   |
-| `idah-image:line`         | `<polyline>` | CVAT has no "line"                               |
-
-The annotation `category` stores the value *id* (e.g. `"car"`); it is mapped to
-the CVAT label name (e.g. `"Car"`) via the dataset's `Labeling-Configuration`.
-
-## Programmatic use
+### Programmatic use
 
 ```python
 from upd_to_cvat import run
@@ -139,36 +80,35 @@ from upd_to_cvat import run
 run("idah-export.upd", "cvat-export", with_images=False)
 ```
 
-## Per-frame interpolation
+---
 
-IDAH stores only sparse **keyframes** (`shape_args["frames"]`). To get the shape
-at any frame, use the interpolation helper:
+## Viewer
 
-```python
-from upd_to_cvat.interpolation import shape_at, iter_frames, kind_of
+The [`viewer/`](viewer/) directory contains a small web application for quickly
+previewing the generated CVAT exports before delivery. It lists every exported
+dataset in a sidebar and provides a frame-by-frame player that overlays the
+annotations on the exported images (or on a blank canvas for annotation-only
+exports).
 
-kind = kind_of(ann.shape_type)               # "bounding-box" | "polygon"
-
-# one frame (None if outside [start, end])
-pts, angle = shape_at(ann.shape_args, frame=42, kind=kind)
-
-# every frame in [start, end]
-for frame, pts, angle in iter_frames(ann.shape_args, kind=kind):
-    ...
+```bash
+cd viewer
+npm install
+npm run dev          # opens at http://localhost:5180/
 ```
 
-Points stay in IDAH's normalised `[0, 1]` space; exact keyframes return their
-original (un-resampled) points. `angle` is in **radians** (linearly
-interpolated for bboxes, `0` for polygons), matching the frontend's
-`getInterpolatedFrame`.
+The dev server automatically discovers every `annotations.xml` under
+`../cvat-export/` and serves it alongside its images.
 
-- **bounding-box** — linear interpolation of the 4 corners between keyframes.
-- **polygon** — morphed with [`pyflubber`](https://pypi.org/project/pyflubber/),
-  a Python port of the **flubber** algorithm used in the frontend, so server-
-  and client-side interpolation agree. It resamples / point-matches rings whose
-  vertex counts differ (ours vary, ~63–67) before interpolating.
+**Features**
 
-> **Note on `pyflubber` + numpy:** pyflubber's `get_area()` uses `np.cross()` on
-> 2-D vectors, which numpy 2.0 removed (and Python ≥ 3.14 requires numpy ≥ 2).
-> `interpolation.py` overrides that one function with a 2-D-safe equivalent at
-> import time — no global numpy monkeypatching, no fork needed.
+- Supports both export formats (per-image shapes and per-frame tracks), with
+  linear interpolation of track boxes between keyframes.
+- Renders boxes (including rotation), polygons, polylines, points, and ellipses,
+  coloured by the label colours from the export metadata.
+- Playback controls: step, play/pause, scrubber, jump to ends, and a 1×–5× speed
+  selector that respects the video's native frame rate. Keyboard shortcuts:
+  `←`/`→` step, `Space` play/pause, `Home`/`End` first/last frame.
+- Canvas zoom (mouse wheel or toolbar), pan (click and drag), and fit-to-frame.
+- Per-label counts for the current frame and task metadata in the side panel.
+
+See [`viewer/README.md`](viewer/README.md) for full details.

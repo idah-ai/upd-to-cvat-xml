@@ -190,23 +190,103 @@ def build_meta(*, task_id: int, name: str, size: int, labels_xml: str,
   </meta>"""
 
 
+def _clamp(v: float, hi: float) -> float:
+    """Clamp a pixel coordinate into ``[0, hi]``."""
+    return 0.0 if v < 0.0 else hi if v > hi else v
+
+
+def _clip_polygon(pts: list[tuple[float, float]], w: float, h: float
+                  ) -> list[tuple[float, float]]:
+    """Sutherland–Hodgman clip of a *closed* polygon to the rect ``[0, w]×[0, h]``.
+
+    Unlike per-vertex clamping (which pins each off-frame vertex onto the border
+    and leaves a degenerate run of collinear points along the edge), this drops
+    the vertices that fall outside the frame and inserts the exact points where
+    the polygon's edges cross the boundary — yielding the true visible
+    silhouette. Coordinates are in pixels.
+    """
+    def clip(poly, inside, intersect):
+        out: list[tuple[float, float]] = []
+        for i in range(len(poly)):
+            a, b = poly[i - 1], poly[i]      # edge a→b (wraps: closed polygon)
+            a_in, b_in = inside(a), inside(b)
+            if b_in:
+                if not a_in:
+                    out.append(intersect(a, b))
+                out.append(b)
+            elif a_in:
+                out.append(intersect(a, b))
+        return out
+
+    def at_x(a, b, x):
+        t = (x - a[0]) / (b[0] - a[0])
+        return (x, a[1] + (b[1] - a[1]) * t)
+
+    def at_y(a, b, y):
+        t = (y - a[1]) / (b[1] - a[1])
+        return (a[0] + (b[0] - a[0]) * t, y)
+
+    poly = pts
+    for inside, intersect in (
+        (lambda p: p[0] >= 0, lambda a, b: at_x(a, b, 0)),   # left
+        (lambda p: p[0] <= w, lambda a, b: at_x(a, b, w)),   # right
+        (lambda p: p[1] >= 0, lambda a, b: at_y(a, b, 0)),   # top
+        (lambda p: p[1] <= h, lambda a, b: at_y(a, b, h)),   # bottom
+    ):
+        if not poly:
+            break
+        poly = clip(poly, inside, intersect)
+    return poly
+
+
 def bbox_to_cvat(points_norm: list[list[float]], angle: float,
-                 w: int, h: int) -> tuple[float, float, float, float, float]:
+                 w: int, h: int, *, clamp: bool = True) -> tuple[float, float, float, float, float]:
     """Normalised corner points + angle → (xtl, ytl, xbr, ybr, rotation°).
 
     The stored corners are the *unrotated* axis-aligned box (the frontend keeps
     rotation separate and rotates about the centre at render time), so min/max
     gives the box and ``rotation`` is the angle. IDAH stores the angle in
     radians; CVAT's ``rotation`` attribute is in degrees.
+
+    With ``clamp`` (default) the box is clipped to the image bounds so no corner
+    lands outside ``[0, w] × [0, h]`` — IDAH normalised points can drift outside
+    ``[0, 1]``. Clamping is skipped for rotated boxes, where the stored corners
+    are the *unrotated* AABB and clipping them would distort the rendered shape.
     """
     xs = [p[0] * w for p in points_norm]
     ys = [p[1] * h for p in points_norm]
-    return min(xs), min(ys), max(xs), max(ys), math.degrees(angle or 0.0)
+    xtl, ytl, xbr, ybr = min(xs), min(ys), max(xs), max(ys)
+    if clamp and not angle:
+        xtl, xbr = _clamp(xtl, w), _clamp(xbr, w)
+        ytl, ybr = _clamp(ytl, h), _clamp(ybr, h)
+    return xtl, ytl, xbr, ybr, math.degrees(angle or 0.0)
 
 
-def polygon_to_cvat(points_norm: list[list[float]], w: int, h: int) -> str:
-    """Normalised points → CVAT 'x1,y1;x2,y2;…' absolute-pixel string."""
-    return ";".join(f"{p[0] * w:.2f},{p[1] * h:.2f}" for p in points_norm)
+def polygon_to_cvat(points_norm: list[list[float]], w: int, h: int, *,
+                    clamp: bool = True, closed: bool = False) -> str:
+    """Normalised points → CVAT 'x1,y1;x2,y2;…' absolute-pixel string.
+
+    IDAH normalised points can drift outside ``[0, 1]``. With ``clamp`` (default):
+
+    - ``closed`` (a polygon) is Sutherland–Hodgman *clipped* to the frame — the
+      off-frame vertices are removed and boundary-crossing points inserted, so
+      the result is the true visible silhouette (see :func:`_clip_polygon`).
+    - an open path (a polyline) is *clamped* per-vertex instead: clipping an open
+      path could split it into disjoint pieces, which a single CVAT polyline
+      can't represent, so each point is pinned into ``[0, w] × [0, h]``.
+
+    A polygon clipped away to nothing (fully off-frame) falls back to per-vertex
+    clamping so we never emit empty geometry.
+    """
+    if not clamp:
+        return ";".join(f"{p[0] * w:.2f},{p[1] * h:.2f}" for p in points_norm)
+    if closed:
+        clipped = _clip_polygon([(p[0] * w, p[1] * h) for p in points_norm], w, h)
+        if len(clipped) >= 3:
+            return ";".join(f"{x:.2f},{y:.2f}" for x, y in clipped)
+        # Degenerate/empty clip: fall back to per-vertex clamp below.
+    return ";".join(f"{_clamp(p[0] * w, w):.2f},{_clamp(p[1] * h, h):.2f}"
+                    for p in points_norm)
 
 
 def _shape_suffix(shape_type: str) -> str:
@@ -215,15 +295,18 @@ def _shape_suffix(shape_type: str) -> str:
 
 
 def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
-                     keyframes_only: bool = False) -> str:
+                     keyframes_only: bool = False, clamp: bool = True) -> str:
     """Build the <track> body for one video from its annotations.
 
     By default every frame in each track's ``[start, end]`` is materialised
     using the interpolation helper (bbox = linear, polygon = flubber), rather
     than emitting only keyframes and relying on CVAT's own interpolation — so
-    the exported geometry matches the frontend's interpolation exactly. The
-    original IDAH keyframes are flagged ``keyframe="1"``, interpolated frames
-    ``keyframe="0"`` (CVAT "for video 1.1" convention).
+    the exported geometry matches the frontend's interpolation exactly. **Every
+    emitted frame is flagged ``keyframe="1"``**: CVAT only stores keyframe
+    shapes and, on import, discards ``keyframe="0"`` frames and re-interpolates
+    linearly between the real keyframes. Flagging every materialised frame a
+    keyframe is therefore what makes CVAT keep our per-frame (flubber) geometry
+    verbatim instead of throwing it away.
 
     With ``keyframes_only`` only the original IDAH keyframes are emitted (each
     ``keyframe="1"``) and CVAT interpolates between them on import. This yields
@@ -249,7 +332,6 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
         if not frames:
             continue
         label = ann.annotation.get("category", "")
-        keyframe_nums = {f["frame"] for f in frames}
         end = sa.get("end", frames[-1]["frame"])
 
         frame_iter = (interp.iter_keyframes(sa, kind=suffix) if keyframes_only
@@ -257,10 +339,15 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
 
         shapes: list[str] = []
         last_points = last_angle = None
+        # Every emitted shape is a keyframe. CVAT discards keyframe="0" frames on
+        # import and re-interpolates linearly between the real keyframes, so in
+        # materialise-all mode marking each frame keyframe="1" is what preserves
+        # our per-frame (flubber) geometry; in keyframes-only mode each emitted
+        # frame is a real keyframe anyway.
         for frame, points, angle in frame_iter:
-            kf = 1 if (keyframes_only or frame in keyframe_nums) else 0
             shapes.append(_frame_shape(suffix, frame, points, w, h,
-                                       keyframe=kf, outside=0, angle=angle))
+                                       keyframe=1, outside=0, angle=angle,
+                                       clamp=clamp))
             last_points, last_angle = points, angle
 
         # Terminate the track with an outside="1" shape one frame past the end,
@@ -268,7 +355,8 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
         # terminating outside shape as a keyframe (keyframe="1").
         if end + 1 <= n_frames - 1:
             shapes.append(_frame_shape(suffix, end + 1, last_points, w, h,
-                                       keyframe=1, outside=1, angle=last_angle))
+                                       keyframe=1, outside=1, angle=last_angle,
+                                       clamp=clamp))
 
         blocks.append(
             f'  <track id="{track_id}" label={quoteattr(label)} source="manual">\n'
@@ -281,18 +369,19 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
 
 
 def _frame_shape(suffix: str, frame: int, points: list, w: int, h: int, *,
-                 keyframe: int, outside: int, angle: float = 0.0) -> str:
+                 keyframe: int, outside: int, angle: float = 0.0,
+                 clamp: bool = True) -> str:
     common = f'frame="{frame}" keyframe="{keyframe}" outside="{outside}" occluded="0"'
 
     if suffix == interp.BBOX:
-        xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, angle, w, h)
+        xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, angle, w, h, clamp=clamp)
         rot_attr = f' rotation="{rot:.2f}"' if rot else ""
         return (f'    <box {common} '
                 f'xtl="{xtl:.2f}" ytl="{ytl:.2f}" xbr="{xbr:.2f}" ybr="{ybr:.2f}"'
                 f'{rot_attr} z_order="0">\n    </box>')
 
     # polygon
-    pts = polygon_to_cvat(points, w, h)
+    pts = polygon_to_cvat(points, w, h, clamp=clamp, closed=True)
     return (f'    <polygon {common} points="{pts}" z_order="0">\n'
             f'    </polygon>')
 
@@ -321,23 +410,24 @@ def build_meta_images(*, task_id: int, name: str, size: int, labels_xml: str) ->
   </meta>"""
 
 
-def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str) -> str | None:
+def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str, *,
+                 clamp: bool = True) -> str | None:
     """One CVAT image-format shape element, or None for unsupported types."""
     common = f'label={quoteattr(label)} source="manual" occluded="0"'
     points = shape_args.get("points", [])
 
     if suffix == "bounding-box":
-        xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, shape_args.get("angle", 0), w, h)
+        xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, shape_args.get("angle", 0), w, h, clamp=clamp)
         rot_attr = f' rotation="{rot:.2f}"' if rot else ""
         return (f'    <box {common} '
                 f'xtl="{xtl:.2f}" ytl="{ytl:.2f}" xbr="{xbr:.2f}" ybr="{ybr:.2f}"'
                 f'{rot_attr} z_order="0"></box>')
 
     if suffix == "polygon":
-        return f'    <polygon {common} points="{polygon_to_cvat(points, w, h)}" z_order="0"></polygon>'
+        return f'    <polygon {common} points="{polygon_to_cvat(points, w, h, clamp=clamp, closed=True)}" z_order="0"></polygon>'
 
     if suffix == "line":   # IDAH line → CVAT polyline (CVAT has no "line")
-        return f'    <polyline {common} points="{polygon_to_cvat(points, w, h)}" z_order="0"></polyline>'
+        return f'    <polyline {common} points="{polygon_to_cvat(points, w, h, clamp=clamp)}" z_order="0"></polyline>'
 
     if suffix in ("ellipse", "circle"):
         # points = [[cx, cy], [rx, ry]] (normalised); circle has rx == ry.
@@ -352,7 +442,7 @@ def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str) -> s
     return None
 
 
-def write_image_body(annotations: list, w: int, h: int) -> str:
+def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True) -> str:
     """Shape elements for one image (CVAT image format).
 
     The shape ``label=`` is the annotation ``category`` (the IDAH tree-path
@@ -362,7 +452,7 @@ def write_image_body(annotations: list, w: int, h: int) -> str:
     for ann in annotations:
         suffix = _shape_suffix(ann.shape_type)
         label = ann.annotation.get("category", "")
-        el = _image_shape(suffix, ann.shape_args, w, h, label)
+        el = _image_shape(suffix, ann.shape_args, w, h, label, clamp=clamp)
         if el is not None:
             out.append(el)
     return "\n".join(out)
@@ -373,7 +463,8 @@ def write_image_body(annotations: list, w: int, h: int) -> str:
 # ---------------------------------------------------------------------------
 
 def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
-                       with_images: bool, keyframes_only: bool = False) -> None:
+                       with_images: bool, keyframes_only: bool = False,
+                       clamp: bool = True) -> None:
     media = upd.medias.get(entry.local_media_id)
     if media is None or media.blob_data is None:
         print(f"  ! entry {entry.id}: media missing, skipping")
@@ -394,7 +485,7 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
             labels_xml=labels_xml, width=width, height=height, source=entry_name,
         )
         body = write_video_body(annotations, width, height, n_frames,
-                                keyframes_only=keyframes_only)
+                                keyframes_only=keyframes_only, clamp=clamp)
 
         xml = (f'<?xml version="1.0" encoding="utf-8"?>\n'
                f'<annotations>\n  <version>1.1</version>\n'
@@ -416,7 +507,8 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
         print(msg)
 
 
-def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: bool) -> None:
+def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: bool,
+                         clamp: bool = True) -> None:
     """Export an idah-image dataset to a single CVAT 'for images 1.1' task.
 
     All entries become ``<image>`` elements in one ``annotations.xml`` (the CVAT
@@ -449,7 +541,7 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: b
             width, height = probe_image(tmp.name)
 
         annotations = upd.annotations.for_entry(entry.id)
-        body = write_image_body(annotations, width, height)
+        body = write_image_body(annotations, width, height, clamp=clamp)
         n_shapes += body.count("<")
         blocks.append(
             f'  <image id="{img_id}" name="{escape(name)}" '
@@ -477,12 +569,17 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: b
 
 
 def run(upd_path: str, output: str, *, with_images: bool = False,
-        dataset_filter: str | None = None, keyframes_only: bool = False) -> None:
+        dataset_filter: str | None = None, keyframes_only: bool = False,
+        clamp: bool = True) -> None:
     """Export every supported dataset in ``upd_path`` to CVAT under ``output``.
 
     ``keyframes_only`` (video only) emits just the original IDAH keyframes and
     lets CVAT interpolate between them, instead of materialising every frame —
     see :func:`write_video_body`.
+
+    ``clamp`` (default) clips every shape to the image/frame bounds so no point
+    lands outside the media — IDAH normalised points can drift outside
+    ``[0, 1]``. Disable it to preserve the raw out-of-bounds coordinates.
     """
     check_ffmpeg(need_ffmpeg=with_images)
     out_dir = Path(output)
@@ -502,7 +599,8 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
             print(f"Dataset {ds.name!r} (modality={ds.modality})")
 
             if ds.modality == "idah-image":
-                export_image_dataset(upd, ds, out_dir, task_id=task_id, with_images=with_images)
+                export_image_dataset(upd, ds, out_dir, task_id=task_id,
+                                     with_images=with_images, clamp=clamp)
                 task_id += 1
                 continue
             if ds.modality != "idah-video":
@@ -514,7 +612,8 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
                     print(f"  ! entry {entry.id}: non-local media, skipping")
                     continue
                 export_video_entry(upd, ds, entry, out_dir, task_id=task_id,
-                                    with_images=with_images, keyframes_only=keyframes_only)
+                                    with_images=with_images,
+                                    keyframes_only=keyframes_only, clamp=clamp)
                 task_id += 1
 
     print(f"\nWritten: {out_dir}")
