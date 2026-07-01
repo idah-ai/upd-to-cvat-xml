@@ -178,3 +178,27 @@ def iter_frames(shape_args: dict, *, kind: str) -> Iterator[tuple[int, list[list
     # Last keyframe and any post-roll up to `end`.
     for f in range(nums[-1], end + 1):
         yield f, _raw(frames[-1]), _angle(frames[-1])
+
+
+def iter_keyframes(shape_args: dict, *, kind: str) -> Iterator[tuple[int, list[list[float]], float]]:
+    """Yield ``(frame, points, angle)`` for the stored keyframes only.
+
+    For keyframe-only export: emit just the original IDAH keyframes and let
+    CVAT interpolate between them on import (rather than materialising every
+    frame with :func:`iter_frames`). Points are the raw keyframe points;
+    ``angle`` matches :func:`iter_frames` — the keyframe's angle for bboxes, 0
+    for polygons.
+
+    When ``start`` precedes the first keyframe, a leading keyframe is emitted at
+    ``start`` holding the first keyframe's shape, mirroring the frontend's
+    pre-roll. The trailing hold to ``end`` needs no extra keyframe: CVAT holds
+    the last keyframe until the caller's ``outside`` terminator at ``end + 1``.
+    """
+    frames = shape_args["frames"]
+    nums = _frame_numbers(shape_args)
+    start, _end = _bounds(shape_args, nums)
+
+    if start < nums[0]:
+        yield start, _raw(frames[0]), _angle(frames[0]) if kind == BBOX else 0.0
+    for kf in frames:
+        yield kf["frame"], _raw(kf), _angle(kf) if kind == BBOX else 0.0

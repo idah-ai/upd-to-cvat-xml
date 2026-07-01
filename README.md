@@ -74,18 +74,22 @@ upd-to-cvat --upd idah-export.upd --output cvat-export
 # also extract every frame as PNG (needs ffmpeg)
 upd-to-cvat --upd idah-export.upd --output cvat-export --with-images
 
+# video: emit only IDAH keyframes, let CVAT interpolate between them
+upd-to-cvat --upd idah-export.upd --output cvat-export --keyframes-only
+
 # limit to one dataset
 upd-to-cvat --upd idah-export.upd --output cvat-export --dataset <dataset-id>
 ```
 
 Equivalent module form: `python -m upd_to_cvat --upd …`.
 
-| Flag            | Description                                                              |
-| --------------- | ------------------------------------------------------------------------ |
-| `--upd`         | Input UPD file (required).                                               |
-| `--output`      | Output root directory (default `cvat-export`).                           |
-| `--with-images` | Video: extract frames as `images/frame_%06d.PNG`. Images: copy the source images into `images/`. (Requires `ffmpeg` for video.) |
-| `--dataset`     | Optional dataset-id filter.                                              |
+| Flag              | Description                                                            |
+| ----------------- | --------------------------------------------------------------------- |
+| `--upd`           | Input UPD file (required).                                            |
+| `--output`        | Output root directory (default `cvat-export`).                        |
+| `--with-images`   | Video: extract frames as `images/frame_%06d.PNG`. Images: copy the source images into `images/`. (Requires `ffmpeg` for video.) |
+| `--keyframes-only`| Video: emit only the IDAH keyframes (each `keyframe="1"`) and let CVAT interpolate between them, instead of materialising every frame. Much smaller files. Bboxes are identical (both interpolate linearly); **polygons differ** — CVAT's polygon interpolation is not flubber, so in-between shapes won't match the frontend. No effect on images. |
+| `--dataset`       | Optional dataset-id filter.                                           |
 
 ## How the mapping works
 

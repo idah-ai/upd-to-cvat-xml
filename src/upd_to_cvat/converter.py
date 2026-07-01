@@ -132,21 +132,26 @@ def _safe_name(name: str) -> str:
 def build_labels(labeling_config: dict) -> str:
     """Build the CVAT <labels> block from a dataset Labeling-Configuration.
 
-    Merges the unique label values across every shape type. IDAH `properties`
-    are empty in practice, so attributes are emitted empty.
+    Uses the value ``id`` (the IDAH tree-path key, e.g. ``"vehicles/truck"``)
+    as the CVAT label ``<name>``, *not* the human ``label`` ("Truck"). IDAH's
+    labels are a tree, so the same ``label`` can appear under different branches
+    — only the ``id`` is unique. CVAT label names must be unique within a task
+    and shapes reference labels by name, so keying on the ``id`` keeps every
+    category distinct and matches the ``label=`` written on each shape/track.
+    IDAH `properties` are empty in practice, so attributes are emitted empty.
     """
-    seen: dict[str, str] = {}          # label name -> color
+    seen: dict[str, str] = {}          # label id -> color
     for shape_cfg in (labeling_config or {}).values():
         for value in shape_cfg.get("values", []):
-            label = value.get("label") or value.get("id")
-            if label and label not in seen:
-                seen[label] = value.get("color", "")
+            vid = value.get("id") or value.get("label")
+            if vid and vid not in seen:
+                seen[vid] = value.get("color", "")
 
     lines = ["      <labels>"]
-    for label, color in seen.items():
+    for vid, color in seen.items():
         lines += [
             "        <label>",
-            f"          <name>{escape(label)}</name>",
+            f"          <name>{escape(vid)}</name>",
             f"          <color>{escape(color)}</color>",
             "          <type>any</type>",
             "          <attributes></attributes>",
@@ -156,29 +161,13 @@ def build_labels(labeling_config: dict) -> str:
     return "\n".join(lines)
 
 
-def build_label_map(labeling_config: dict) -> dict[str, str]:
-    """Map an annotation ``category`` (the value *id*) → CVAT label name.
-
-    Annotations store the value ``id`` (e.g. ``"car"``); CVAT ``<labels>`` use
-    the human ``label`` (e.g. ``"Car"``). This keeps shape ``label=`` attributes
-    consistent with the ``<labels>`` block. Unknown ids fall back to themselves.
-    """
-    mapping: dict[str, str] = {}
-    for shape_cfg in (labeling_config or {}).values():
-        for value in shape_cfg.get("values", []):
-            vid = value.get("id")
-            if vid and vid not in mapping:
-                mapping[vid] = value.get("label") or vid
-    return mapping
-
-
-def build_meta(*, task_id: str, name: str, size: int, labels_xml: str,
+def build_meta(*, task_id: int, name: str, size: int, labels_xml: str,
                width: int, height: int, source: str) -> str:
     """Emit the CVAT <meta> block (video / interpolation mode)."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
     return f"""  <meta>
     <task>
-      <id>{escape(str(task_id))}</id>
+      <id>{task_id}</id>
       <name>{escape(name)}</name>
       <size>{size}</size>
       <mode>interpolation</mode>
@@ -225,15 +214,26 @@ def _shape_suffix(shape_type: str) -> str:
     return shape_type.split(":", 1)[-1]
 
 
-def write_video_body(annotations: list, w: int, h: int, n_frames: int) -> str:
+def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
+                     keyframes_only: bool = False) -> str:
     """Build the <track> body for one video from its annotations.
 
-    Every frame in each track's ``[start, end]`` is materialised using the
-    interpolation helper (bbox = linear, polygon = flubber), rather than
-    emitting only keyframes and relying on CVAT's own interpolation — so the
-    exported geometry matches the frontend's interpolation exactly. The
+    By default every frame in each track's ``[start, end]`` is materialised
+    using the interpolation helper (bbox = linear, polygon = flubber), rather
+    than emitting only keyframes and relying on CVAT's own interpolation — so
+    the exported geometry matches the frontend's interpolation exactly. The
     original IDAH keyframes are flagged ``keyframe="1"``, interpolated frames
     ``keyframe="0"`` (CVAT "for video 1.1" convention).
+
+    With ``keyframes_only`` only the original IDAH keyframes are emitted (each
+    ``keyframe="1"``) and CVAT interpolates between them on import. This yields
+    far smaller files; bboxes are identical (both sides interpolate linearly),
+    but polygons differ — CVAT's polygon interpolation is not flubber, so the
+    in-between shapes will not match the frontend.
+
+    The track ``label=`` is the annotation ``category`` (the IDAH tree-path
+    *id*, e.g. ``"vehicles/truck"``), used verbatim so it matches the ``id``-
+    keyed ``<labels>`` block — CVAT rejects tracks whose label is not declared.
     """
     blocks: list[str] = []
     track_id = 0
@@ -248,26 +248,30 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int) -> str:
         frames = sa.get("frames", [])
         if not frames:
             continue
-        category = ann.annotation.get("category", "")
+        label = ann.annotation.get("category", "")
         keyframe_nums = {f["frame"] for f in frames}
         end = sa.get("end", frames[-1]["frame"])
 
+        frame_iter = (interp.iter_keyframes(sa, kind=suffix) if keyframes_only
+                      else interp.iter_frames(sa, kind=suffix))
+
         shapes: list[str] = []
         last_points = last_angle = None
-        for frame, points, angle in interp.iter_frames(sa, kind=suffix):
-            kf = 1 if frame in keyframe_nums else 0
+        for frame, points, angle in frame_iter:
+            kf = 1 if (keyframes_only or frame in keyframe_nums) else 0
             shapes.append(_frame_shape(suffix, frame, points, w, h,
                                        keyframe=kf, outside=0, angle=angle))
             last_points, last_angle = points, angle
 
         # Terminate the track with an outside="1" shape one frame past the end,
-        # unless the track already runs to the last video frame.
+        # unless the track already runs to the last video frame. CVAT marks the
+        # terminating outside shape as a keyframe (keyframe="1").
         if end + 1 <= n_frames - 1:
             shapes.append(_frame_shape(suffix, end + 1, last_points, w, h,
-                                       keyframe=0, outside=1, angle=last_angle))
+                                       keyframe=1, outside=1, angle=last_angle))
 
         blocks.append(
-            f'  <track id="{track_id}" label={quoteattr(category)} source="manual">\n'
+            f'  <track id="{track_id}" label={quoteattr(label)} source="manual">\n'
             + "\n".join(shapes)
             + "\n  </track>"
         )
@@ -297,12 +301,12 @@ def _frame_shape(suffix: str, frame: int, points: list, w: int, h: int, *,
 # CVAT "for images 1.1" builders
 # ---------------------------------------------------------------------------
 
-def build_meta_images(*, task_id: str, name: str, size: int, labels_xml: str) -> str:
+def build_meta_images(*, task_id: int, name: str, size: int, labels_xml: str) -> str:
     """Emit the CVAT <meta> block for an image task (annotation mode)."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
     return f"""  <meta>
     <task>
-      <id>{escape(str(task_id))}</id>
+      <id>{task_id}</id>
       <name>{escape(name)}</name>
       <size>{size}</size>
       <mode>annotation</mode>
@@ -348,13 +352,16 @@ def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str) -> s
     return None
 
 
-def write_image_body(annotations: list, w: int, h: int, label_map: dict[str, str]) -> str:
-    """Shape elements for one image (CVAT image format)."""
+def write_image_body(annotations: list, w: int, h: int) -> str:
+    """Shape elements for one image (CVAT image format).
+
+    The shape ``label=`` is the annotation ``category`` (the IDAH tree-path
+    *id*) verbatim, matching the ``id``-keyed ``<labels>`` block.
+    """
     out: list[str] = []
     for ann in annotations:
         suffix = _shape_suffix(ann.shape_type)
-        label = label_map.get(ann.annotation.get("category", ""),
-                              ann.annotation.get("category", ""))
+        label = ann.annotation.get("category", "")
         el = _image_shape(suffix, ann.shape_args, w, h, label)
         if el is not None:
             out.append(el)
@@ -365,7 +372,8 @@ def write_image_body(annotations: list, w: int, h: int, label_map: dict[str, str
 # Export driver
 # ---------------------------------------------------------------------------
 
-def export_video_entry(upd, ds, entry, out_dir: Path, *, with_images: bool) -> None:
+def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
+                       with_images: bool, keyframes_only: bool = False) -> None:
     media = upd.medias.get(entry.local_media_id)
     if media is None or media.blob_data is None:
         print(f"  ! entry {entry.id}: media missing, skipping")
@@ -382,10 +390,11 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, with_images: bool) -> N
         annotations = upd.annotations.for_entry(entry.id)
         labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
         meta = build_meta(
-            task_id=entry.id, name=entry_name, size=n_frames,
+            task_id=task_id, name=entry_name, size=n_frames,
             labels_xml=labels_xml, width=width, height=height, source=entry_name,
         )
-        body = write_video_body(annotations, width, height, n_frames)
+        body = write_video_body(annotations, width, height, n_frames,
+                                keyframes_only=keyframes_only)
 
         xml = (f'<?xml version="1.0" encoding="utf-8"?>\n'
                f'<annotations>\n  <version>1.1</version>\n'
@@ -407,13 +416,12 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, with_images: bool) -> N
         print(msg)
 
 
-def export_image_dataset(upd, ds, out_dir: Path, *, with_images: bool) -> None:
+def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: bool) -> None:
     """Export an idah-image dataset to a single CVAT 'for images 1.1' task.
 
     All entries become ``<image>`` elements in one ``annotations.xml`` (the CVAT
     images convention), optionally alongside an ``images/`` folder.
     """
-    label_map = build_label_map(ds.metadata.get("Labeling-Configuration", {}))
     labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
 
     task_dir = out_dir / _safe_name(ds.name)
@@ -441,7 +449,7 @@ def export_image_dataset(upd, ds, out_dir: Path, *, with_images: bool) -> None:
             width, height = probe_image(tmp.name)
 
         annotations = upd.annotations.for_entry(entry.id)
-        body = write_image_body(annotations, width, height, label_map)
+        body = write_image_body(annotations, width, height)
         n_shapes += body.count("<")
         blocks.append(
             f'  <image id="{img_id}" name="{escape(name)}" '
@@ -454,7 +462,7 @@ def export_image_dataset(upd, ds, out_dir: Path, *, with_images: bool) -> None:
             images_dir.mkdir(parents=True, exist_ok=True)
             (images_dir / name).write_bytes(media.blob_data)
 
-    meta = build_meta_images(task_id=ds.id, name=ds.name, size=len(blocks),
+    meta = build_meta_images(task_id=task_id, name=ds.name, size=len(blocks),
                              labels_xml=labels_xml)
     xml = (f'<?xml version="1.0" encoding="utf-8"?>\n'
            f'<annotations>\n  <version>1.1</version>\n'
@@ -469,8 +477,13 @@ def export_image_dataset(upd, ds, out_dir: Path, *, with_images: bool) -> None:
 
 
 def run(upd_path: str, output: str, *, with_images: bool = False,
-        dataset_filter: str | None = None) -> None:
-    """Export every supported dataset in ``upd_path`` to CVAT under ``output``."""
+        dataset_filter: str | None = None, keyframes_only: bool = False) -> None:
+    """Export every supported dataset in ``upd_path`` to CVAT under ``output``.
+
+    ``keyframes_only`` (video only) emits just the original IDAH keyframes and
+    lets CVAT interpolate between them, instead of materialising every frame —
+    see :func:`write_video_body`.
+    """
     check_ffmpeg(need_ffmpeg=with_images)
     out_dir = Path(output)
 
@@ -479,11 +492,18 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
         if dataset_filter:
             datasets = [d for d in datasets if d.id == dataset_filter]
 
+        # CVAT task <id> must be an integer; IDAH ids are UUIDv7 strings. CVAT
+        # reassigns its own id on import, so a sequential counter per exported
+        # task is sufficient (the IDAH identity is preserved in the task name /
+        # folder name).
+        task_id = 0
+
         for ds in datasets:
             print(f"Dataset {ds.name!r} (modality={ds.modality})")
 
             if ds.modality == "idah-image":
-                export_image_dataset(upd, ds, out_dir, with_images=with_images)
+                export_image_dataset(upd, ds, out_dir, task_id=task_id, with_images=with_images)
+                task_id += 1
                 continue
             if ds.modality != "idah-video":
                 print(f"  ! unsupported modality {ds.modality!r}, skipping")
@@ -493,6 +513,8 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
                 if not entry.is_local:
                     print(f"  ! entry {entry.id}: non-local media, skipping")
                     continue
-                export_video_entry(upd, ds, entry, out_dir, with_images=with_images)
+                export_video_entry(upd, ds, entry, out_dir, task_id=task_id,
+                                    with_images=with_images, keyframes_only=keyframes_only)
+                task_id += 1
 
     print(f"\nWritten: {out_dir}")
