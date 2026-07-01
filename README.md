@@ -7,8 +7,10 @@ annotation packages. The output format is selected automatically per dataset
 
 - **`idah-video`** → *CVAT for video 1.1*: one CVAT task folder per video entry,
   with annotation tracks.
+  - Supported shapes: bounding box and polygon.
 - **`idah-image`** → *CVAT for images 1.1*: the whole dataset as a single task,
   with one image per entry.
+  - Supported shapes: bounding box, polygon, ellipse, circle, and line.
 
 ```
 # idah-video
@@ -19,9 +21,6 @@ cvat-export/<dataset>/<entry>_<media-id>/annotations.xml
 cvat-export/<dataset>/annotations.xml
                       images/<name>.jpg                            # --with-images
 ```
-
-Supported shapes: bounding box and polygon (video and images); plus ellipse,
-circle, and line for images.
 
 ---
 
