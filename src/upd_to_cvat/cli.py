@@ -15,7 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--upd", required=True, help="Input UPD file path.")
     p.add_argument("--output", default="cvat-export", help="Output root directory.")
     p.add_argument("--with-images", action="store_true",
-                   help="Also extract frame PNGs via ffmpeg (requires ffmpeg).")
+                   help="Also extract frame PNGs (video) / copy source images.")
     p.add_argument("--no-clamp", dest="clamp", action="store_false",
                    help="Disable clamping shapes to the image/frame bounds. By "
                         "default every point is clipped into [0, width] × "

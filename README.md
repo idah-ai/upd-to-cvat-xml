@@ -28,21 +28,28 @@ circle, and line for images.
 ## Requirements
 
 - **Python ≥ 3.14**
-- **ffmpeg / ffprobe** available on `PATH`. CVAT XML uses absolute pixel
-  coordinates, so every video and image is probed for its dimensions (and frame
-  count, for video) — required even without `--with-images`.
-  (`brew install ffmpeg` / `apt-get install ffmpeg`.)
+
+## Dependencies
+
+All are installed automatically by `pip install .` (see below).
+
+- [**upd-sdk-python**](https://github.com/idah-ai/upd-sdk-python) — the IDAH SDK used to read
+  the input UPD files. Not on PyPI; pulled from its public GitHub repo over HTTPS.
+- [**PyAV**](https://pyav.org) (`av`) — probes media dimensions and frame counts
+  (CVAT XML uses absolute pixel coordinates) and extracts video frames for
+  `--with-images`. Its wheel bundles the ffmpeg libraries, so no system ffmpeg is
+  required.
+- [**NumPy**](https://numpy.org) (`numpy`) — array maths underpinning coordinate
+  and shape processing.
+- [**pyflubber**](https://pypi.org/project/pyflubber/) — flubber-equivalent
+  polygon morphing used to interpolate polygon shapes between keyframes.
 
 ## Installation
 
-The [`upd`](https://github.com/idah-ai/upd-sdk-python) SDK is not on PyPI; it is
-declared as a dependency and pulled from its public GitHub repository over HTTPS.
-From a fresh virtual environment:
-
 ```bash
-python3.14 -m venv .venv
+python3.14 -m venv .venv      # or your Python 3.14 interpreter
 source .venv/bin/activate
-pip install .                 # installs this package + the upd SDK from git
+pip install .                 # installs this package + the dependencies
 ```
 
 ## Usage
@@ -51,7 +58,7 @@ pip install .                 # installs this package + the upd SDK from git
 # annotations only
 upd-to-cvat --upd idah-export.upd --output cvat-export
 
-# also extract every video frame as PNG (needs ffmpeg)
+# also extract every video frame as PNG
 upd-to-cvat --upd idah-export.upd --output cvat-export --with-images
 
 # limit to a single dataset
@@ -62,7 +69,7 @@ upd-to-cvat --upd idah-export.upd --output cvat-export --dataset <dataset-id>
 | ----------------- | --------------------------------------------------------------------- |
 | `--upd`           | Input UPD file (required).                                            |
 | `--output`        | Output root directory (default `cvat-export`).                        |
-| `--with-images`   | Video: extract frames as `images/frame_%06d.PNG`. Images: copy the source images into `images/`. (Requires `ffmpeg` for video.) |
+| `--with-images`   | Video: extract frames as `images/frame_%06d.PNG`. Images: copy the source images into `images/`. |
 | `--no-clamp`      | Keep raw coordinates instead of clamping each shape to the media bounds. By default shapes are clipped to `[0, width] × [0, height]`, since normalised IDAH points can drift slightly outside `[0, 1]`. |
 | `--dataset`       | Optional dataset-id filter.                                          |
 
@@ -81,30 +88,13 @@ run("idah-export.upd", "cvat-export", with_images=False)
 ## Viewer
 
 The [`viewer/`](viewer/) directory contains a small web application for quickly
-previewing the generated CVAT exports before delivery. It lists every exported
-dataset in a sidebar and provides a frame-by-frame player that overlays the
-annotations on the exported images (or on a blank canvas for annotation-only
-exports).
+previewing the generated CVAT exports before delivery. It provides a
+frame-by-frame player that overlays the annotations on the exported images.
 
 ```bash
 cd viewer
 npm install
 npm run dev          # opens at http://localhost:5180/
 ```
-
-The dev server automatically discovers every `annotations.xml` under
-`../cvat-export/` and serves it alongside its images.
-
-**Features**
-
-- Supports both export formats (per-image shapes and per-frame tracks), with
-  linear interpolation of track boxes between keyframes.
-- Renders boxes (including rotation), polygons, polylines, points, and ellipses,
-  coloured by the label colours from the export metadata.
-- Playback controls: step, play/pause, scrubber, jump to ends, and a 1×–5× speed
-  selector that respects the video's native frame rate. Keyboard shortcuts:
-  `←`/`→` step, `Space` play/pause, `Home`/`End` first/last frame.
-- Canvas zoom (mouse wheel or toolbar), pan (click and drag), and fit-to-frame.
-- Per-label counts for the current frame and task metadata in the side panel.
 
 See [`viewer/README.md`](viewer/README.md) for full details.

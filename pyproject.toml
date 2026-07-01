@@ -19,6 +19,7 @@ dependencies = [
     "upd @ git+https://github.com/idah-ai/upd-sdk-python.git",
     "numpy>=2.0",
     "pyflubber>=0.1.2",   # flubber-equivalent polygon morphing (see interpolation.py)
+    "av>=14",             # bundled ffmpeg libs: video/image probing + frame extraction, no system ffmpeg
 ]
 
 [project.optional-dependencies]

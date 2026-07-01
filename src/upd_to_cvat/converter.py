@@ -25,99 +25,120 @@ Both modalities are supported:
                          images/<name>.jpg                            (--with-images)
 
 CVAT stores absolute pixel coordinates while IDAH stores normalised [0, 1]
-points, so each video/image is probed with ``ffprobe`` for its dimensions (and
-frame count, for video). ``ffprobe`` is therefore required even in
-annotations-only mode; ``ffmpeg`` frame decoding is only needed with
-``with_images`` for video (both ship in the same package).
+points, so each video/image is probed with PyAV (``av``) for its dimensions
+(and frame count, for video). PyAV bundles the ffmpeg libraries in its wheel,
+so no system ``ffmpeg``/``ffprobe`` binary is required; frame decoding to PNGs
+is only done with ``with_images`` for video.
 """
 
 from __future__ import annotations
 
-import json
 import math
+import os
 import re
-import shutil
-import subprocess
+import sys
 import tempfile
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape, quoteattr
 
+import av
 from upd import UPD
 
 from . import interpolation as interp
 
 
 # ---------------------------------------------------------------------------
-# ffmpeg / ffprobe
+# Media probing / frame extraction (PyAV — bundles ffmpeg, no system binary)
 # ---------------------------------------------------------------------------
 
-def check_ffmpeg(*, need_ffmpeg: bool) -> None:
-    """Ensure ffprobe (always) and ffmpeg (when extracting frames) are on PATH."""
-    if shutil.which("ffprobe") is None:
-        raise RuntimeError(
-            "ffprobe not found on PATH. CVAT export needs video dimensions; "
-            "please install ffmpeg (e.g. `brew install ffmpeg` or "
-            "`apt-get install ffmpeg`)."
-        )
-    if need_ffmpeg and shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "ffmpeg not found on PATH. --with-images extracts frame images; "
-            "please install ffmpeg (e.g. `brew install ffmpeg` or "
-            "`apt-get install ffmpeg`)."
-        )
-
-
 def probe_video(path: str) -> tuple[int, int, int]:
-    """Return (width, height, n_frames) for a video file via ffprobe."""
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height,nb_frames",
-         "-of", "json", path],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    stream = json.loads(out)["streams"][0]
-    width = int(stream["width"])
-    height = int(stream["height"])
-    nb = stream.get("nb_frames")
-    # nb_frames can be "N/A" for some containers; fall back to a frame count.
-    if nb in (None, "N/A"):
+    """Return (width, height, n_frames) for a video file via PyAV."""
+    with av.open(path) as container:
+        stream = container.streams.video[0]
+        width = stream.codec_context.width
+        height = stream.codec_context.height
+        n_frames = stream.frames
+    # stream.frames is the container's metadata count and is 0 for some
+    # containers; fall back to decode-counting the actual frames.
+    if n_frames <= 0:
         n_frames = _count_frames(path)
-    else:
-        n_frames = int(nb)
     return width, height, n_frames
 
 
 def _count_frames(path: str) -> int:
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-count_frames", "-show_entries", "stream=nb_read_frames",
-         "-of", "default=nokey=1:noprint_wrappers=1", path],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    return int(out) if out.isdigit() else 0
+    """Exact frame count by decoding every frame of the first video stream."""
+    with av.open(path) as container:
+        return sum(1 for _ in container.decode(video=0))
 
 
-def extract_frames(video_path: str, images_dir: Path) -> int:
-    """Extract every frame to images/frame_%06d.PNG. Returns the count."""
+def _status(text: str, *, final: bool = False) -> None:
+    """Render an in-place progress line.
+
+    On a TTY the line is rewritten with ``\\r`` (padded to clear the previous,
+    possibly longer, line) and only terminated with a newline when ``final``.
+    When output is redirected (not a TTY) the intermediate updates are dropped —
+    only the final line is emitted — so logs and pipes stay clean.
+    """
+    if sys.stdout.isatty():
+        print(f"\r{text:<56}", end="\n" if final else "", flush=True)
+    elif final:
+        print(text)
+
+
+def extract_frames(video_path: str, images_dir: Path, *,
+                   total: int | None = None) -> int:
+    """Extract every frame to images/frame_%06d.PNG. Returns the count.
+
+    Frames are decoded sequentially (with ffmpeg's multithreaded decoding) while
+    the PNG encode + write of each frame is fanned out across a thread pool —
+    PyAV releases the GIL inside ``encode``, so this scales across cores. PNG
+    stays lossless but uses ``compression_level=1`` (fast, ~5% larger files than
+    the default). ``total`` (the expected frame count) drives the progress line.
+
+    A bounded in-flight window applies backpressure so decoded frames can't pile
+    up in memory faster than they are written (~6 MB per 1080p RGB frame).
+    """
     images_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-v", "error", "-y", "-i", video_path,
-         "-start_number", "0", str(images_dir / "frame_%06d.PNG")],
-        check=True,
-    )
-    return len(list(images_dir.glob("frame_*.PNG")))
+    workers = min(8, os.cpu_count() or 4)
+    max_inflight = workers * 4
+    step = max(1, (total or 100) // 100)
+
+    def encode_write(idx: int, rgb: av.VideoFrame) -> None:
+        enc = av.CodecContext.create("png", "w")
+        enc.pix_fmt = "rgb24"
+        enc.width, enc.height = rgb.width, rgb.height
+        enc.options = {"compression_level": "1"}  # lossless; low level = fast
+        data = b"".join(bytes(p) for p in enc.encode(rgb))
+        (images_dir / f"frame_{idx:06d}.PNG").write_bytes(data)
+
+    n = 0
+    pending: deque[Future] = deque()
+    with av.open(video_path) as container, \
+            ThreadPoolExecutor(max_workers=workers) as pool:
+        container.streams.video[0].thread_type = "AUTO"
+        for frame in container.decode(video=0):
+            rgb = frame.reformat(format="rgb24")
+            pending.append(pool.submit(encode_write, n, rgb))
+            n += 1
+            if len(pending) >= max_inflight:
+                pending.popleft().result()        # backpressure
+            if n % step == 0:
+                pct = f" ({n * 100 // total}%)" if total else ""
+                _status(f"    extracting frames: {n}/{total or '?'}{pct}")
+        for fut in pending:                       # drain remaining writes
+            fut.result()
+    _status(f"    {n} frames extracted", final=True)
+    return n
 
 
 def probe_image(path: str) -> tuple[int, int]:
-    """Return (width, height) for an image file via ffprobe."""
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "json", path],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    s = json.loads(out)["streams"][0]
-    return int(s["width"]), int(s["height"])
+    """Return (width, height) for an image file via PyAV."""
+    with av.open(path) as container:
+        stream = container.streams.video[0]
+        return stream.codec_context.width, stream.codec_context.height
 
 
 # ---------------------------------------------------------------------------
@@ -490,12 +511,10 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
         (task_dir / "annotations.xml").write_text(xml, encoding="utf-8")
 
         n_tracks = body.count("<track ")
-        msg = f"  [{entry_name}] {width}x{height}, {n_frames} frames, {n_tracks} tracks"
+        print(f"  [{entry_name}] {width}x{height}, {n_frames} frames, {n_tracks} tracks")
 
         if with_images:
-            n = extract_frames(tmp.name, task_dir / "images")
-            msg += f", {n} frames extracted"
-        print(msg)
+            extract_frames(tmp.name, task_dir / "images", total=n_frames)
 
 
 def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: bool,
@@ -567,7 +586,6 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
     lands outside the media — IDAH normalised points can drift outside
     ``[0, 1]``. Disable it to preserve the raw out-of-bounds coordinates.
     """
-    check_ffmpeg(need_ffmpeg=with_images)
     out_dir = Path(output)
 
     with UPD.open(upd_path, read_only=True) as upd:
