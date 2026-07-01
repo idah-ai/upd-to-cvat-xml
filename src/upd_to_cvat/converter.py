@@ -295,24 +295,18 @@ def _shape_suffix(shape_type: str) -> str:
 
 
 def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
-                     keyframes_only: bool = False, clamp: bool = True) -> str:
+                     clamp: bool = True) -> str:
     """Build the <track> body for one video from its annotations.
 
-    By default every frame in each track's ``[start, end]`` is materialised
-    using the interpolation helper (bbox = linear, polygon = flubber), rather
-    than emitting only keyframes and relying on CVAT's own interpolation — so
-    the exported geometry matches the frontend's interpolation exactly. **Every
+    Every frame in each track's ``[start, end]`` is materialised using the
+    interpolation helper (bbox = linear, polygon = flubber), rather than
+    emitting only keyframes and relying on CVAT's own interpolation — so the
+    exported geometry matches the frontend's interpolation exactly. **Every
     emitted frame is flagged ``keyframe="1"``**: CVAT only stores keyframe
     shapes and, on import, discards ``keyframe="0"`` frames and re-interpolates
     linearly between the real keyframes. Flagging every materialised frame a
     keyframe is therefore what makes CVAT keep our per-frame (flubber) geometry
     verbatim instead of throwing it away.
-
-    With ``keyframes_only`` only the original IDAH keyframes are emitted (each
-    ``keyframe="1"``) and CVAT interpolates between them on import. This yields
-    far smaller files; bboxes are identical (both sides interpolate linearly),
-    but polygons differ — CVAT's polygon interpolation is not flubber, so the
-    in-between shapes will not match the frontend.
 
     The track ``label=`` is the annotation ``category`` (the IDAH tree-path
     *id*, e.g. ``"vehicles/truck"``), used verbatim so it matches the ``id``-
@@ -334,16 +328,14 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
         label = ann.annotation.get("category", "")
         end = sa.get("end", frames[-1]["frame"])
 
-        frame_iter = (interp.iter_keyframes(sa, kind=suffix) if keyframes_only
-                      else interp.iter_frames(sa, kind=suffix))
+        frame_iter = interp.iter_frames(sa, kind=suffix)
 
         shapes: list[str] = []
         last_points = last_angle = None
         # Every emitted shape is a keyframe. CVAT discards keyframe="0" frames on
-        # import and re-interpolates linearly between the real keyframes, so in
-        # materialise-all mode marking each frame keyframe="1" is what preserves
-        # our per-frame (flubber) geometry; in keyframes-only mode each emitted
-        # frame is a real keyframe anyway.
+        # import and re-interpolates linearly between the real keyframes, so
+        # marking each materialised frame keyframe="1" is what preserves our
+        # per-frame (flubber) geometry.
         for frame, points, angle in frame_iter:
             shapes.append(_frame_shape(suffix, frame, points, w, h,
                                        keyframe=1, outside=0, angle=angle,
@@ -463,8 +455,7 @@ def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True) -
 # ---------------------------------------------------------------------------
 
 def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
-                       with_images: bool, keyframes_only: bool = False,
-                       clamp: bool = True) -> None:
+                       with_images: bool, clamp: bool = True) -> None:
     media = upd.medias.get(entry.local_media_id)
     if media is None or media.blob_data is None:
         print(f"  ! entry {entry.id}: media missing, skipping")
@@ -485,7 +476,7 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
             labels_xml=labels_xml, width=width, height=height, source=entry_name,
         )
         body = write_video_body(annotations, width, height, n_frames,
-                                keyframes_only=keyframes_only, clamp=clamp)
+                                clamp=clamp)
 
         xml = (f'<?xml version="1.0" encoding="utf-8"?>\n'
                f'<annotations>\n  <version>1.1</version>\n'
@@ -569,13 +560,8 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: b
 
 
 def run(upd_path: str, output: str, *, with_images: bool = False,
-        dataset_filter: str | None = None, keyframes_only: bool = False,
-        clamp: bool = True) -> None:
+        dataset_filter: str | None = None, clamp: bool = True) -> None:
     """Export every supported dataset in ``upd_path`` to CVAT under ``output``.
-
-    ``keyframes_only`` (video only) emits just the original IDAH keyframes and
-    lets CVAT interpolate between them, instead of materialising every frame —
-    see :func:`write_video_body`.
 
     ``clamp`` (default) clips every shape to the image/frame bounds so no point
     lands outside the media — IDAH normalised points can drift outside
@@ -612,8 +598,7 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
                     print(f"  ! entry {entry.id}: non-local media, skipping")
                     continue
                 export_video_entry(upd, ds, entry, out_dir, task_id=task_id,
-                                    with_images=with_images,
-                                    keyframes_only=keyframes_only, clamp=clamp)
+                                    with_images=with_images, clamp=clamp)
                 task_id += 1
 
     print(f"\nWritten: {out_dir}")

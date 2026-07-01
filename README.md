@@ -54,9 +54,6 @@ upd-to-cvat --upd idah-export.upd --output cvat-export
 # also extract every video frame as PNG (needs ffmpeg)
 upd-to-cvat --upd idah-export.upd --output cvat-export --with-images
 
-# video: export only IDAH keyframes and let CVAT interpolate between them
-upd-to-cvat --upd idah-export.upd --output cvat-export --keyframes-only
-
 # limit to a single dataset
 upd-to-cvat --upd idah-export.upd --output cvat-export --dataset <dataset-id>
 ```
@@ -66,7 +63,6 @@ upd-to-cvat --upd idah-export.upd --output cvat-export --dataset <dataset-id>
 | `--upd`           | Input UPD file (required).                                            |
 | `--output`        | Output root directory (default `cvat-export`).                        |
 | `--with-images`   | Video: extract frames as `images/frame_%06d.PNG`. Images: copy the source images into `images/`. (Requires `ffmpeg` for video.) |
-| `--keyframes-only`| Video: export only the IDAH keyframes and let CVAT interpolate between them, producing much smaller files. Bounding boxes are identical either way; polygon in-between shapes may differ from the frontend. No effect on images. |
 | `--no-clamp`      | Keep raw coordinates instead of clamping each shape to the media bounds. By default shapes are clipped to `[0, width] × [0, height]`, since normalised IDAH points can drift slightly outside `[0, 1]`. |
 | `--dataset`       | Optional dataset-id filter.                                          |
 
