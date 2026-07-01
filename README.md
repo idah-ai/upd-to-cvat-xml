@@ -83,6 +83,17 @@ from upd_to_cvat import run
 run("idah-export.upd", "cvat-export", with_images=False)
 ```
 
+## Tests
+
+The suite in [`tests/`](tests/) covers the pure conversion logic — interpolation,
+coordinate clamping / polygon clipping, and the CVAT XML builders (media probing
+and frame extraction, which need PyAV and real blobs, are out of scope).
+
+```bash
+pip install ".[dev]"          # installs pytest
+pytest
+```
+
 ---
 
 ## Viewer

@@ -35,3 +35,7 @@ upd-to-cvat = "upd_to_cvat.cli:main"
 [tool.setuptools.packages.find]
 where   = ["src"]
 include = ["upd_to_cvat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-q"
