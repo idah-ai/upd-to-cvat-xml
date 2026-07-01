@@ -1,6 +1,7 @@
 <script>
   import { untrack } from 'svelte';
   import { parseCvatXml, colorForLabel } from './lib/cvat.js';
+  import { isReady, loadImage } from './lib/imageCache.js';
   import FrameCanvas from './lib/FrameCanvas.svelte';
 
   let datasets = $state([]);
@@ -89,27 +90,41 @@
     playing = !playing;
   }
 
-  // Time-based playback loop: the frame is derived from real elapsed time, so
-  // playback runs at true speed (fps × multiplier) regardless of render rate.
+  // Playback loop. Advances one frame per frame-duration, but never moves on
+  // until the next frame's image has decoded — so annotations can't run ahead
+  // of the picture. Playback effectively "buffers" while a frame is loading.
   $effect(() => {
     if (!playing || !model) return;
-    const fpsEff = Math.max(1, fps * speed);
     const count = model.frameCount;
-    const startFrame = untrack(() => frame);
-    const startTime = performance.now();
-    // Tick at up to 60 Hz; the frame is computed from elapsed time, so higher
-    // effective rates (e.g. 5×) just advance multiple frames per tick.
+    const dur = 1000 / Math.max(1, fps * speed); // ms per displayed frame
+    const dir = selected?.imagesDir;
+    const imageCount = dir ? selected.imageCount : 0;
+    const urlFor = (i) =>
+      dir && i >= 0 && i < count ? `${dir}/${model.frameName(i)}.PNG` : null;
+
+    let nextDue = performance.now() + dur;
     const id = setInterval(() => {
-      const advanced = Math.floor(((performance.now() - startTime) / 1000) * fpsEff);
-      const target = startFrame + advanced;
-      if (target >= count - 1) {
-        // Reached the end: land on the last frame and stop.
-        frame = count - 1;
-        playing = false;
+      const now = performance.now();
+      if (now < nextDue) return;
+
+      const cur = untrack(() => frame);
+      if (cur >= count - 1) {
+        playing = false; // stop at the end
         return;
       }
-      if (target !== untrack(() => frame)) frame = target;
-    }, 1000 / 60);
+      const next = cur + 1;
+
+      // Gate on the image only for frames that actually have one exported.
+      if (next < imageCount && !isReady(urlFor(next))) {
+        loadImage(urlFor(next));
+        for (let k = 2; k <= 15; k++) loadImage(urlFor(next + k - 1));
+        return; // hold here (don't advance, don't reset the clock) until ready
+      }
+
+      frame = next;
+      for (let k = 1; k <= 15; k++) loadImage(urlFor(next + k));
+      nextDue = now + dur;
+    }, 1000 / 120);
     return () => clearInterval(id);
   });
 
@@ -203,7 +218,7 @@
           {/each}
         </select>
         <span class="frame-count">
-          {frame + 1} / {model.frameCount}
+          {frame} / {model.frameCount - 1}
         </span>
       </div>
     {:else}

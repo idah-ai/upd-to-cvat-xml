@@ -1,5 +1,6 @@
 <script>
   import { colorForLabel } from './cvat.js';
+  import { loadImage, getImage, imageStatus, clearImages, subscribe } from './imageCache.js';
 
   let { model, imagesDir, frame, showLabels = true, showFill = false } = $props();
 
@@ -7,6 +8,7 @@
   let wrap;
   let displayImg = $state(null); // last successfully decoded image being shown
   let imgStatus = $state('none'); // none | loading | ok | error
+  let loading = $state(false); // current frame's image is still decoding
 
   // View transform: image is drawn at (tx, ty) with `scale` px per image unit.
   let scale = $state(1);
@@ -15,10 +17,10 @@
   let fitScale = $state(1); // scale that fits the whole frame in the viewport
   let fitted = false; // becomes true once the current model has been fit
   let dragging = $state(false);
+  let loadTick = $state(0); // bumped when a shared-cache image finishes loading
 
-  // Cache decoded images so scrubbing/replaying is instant and flicker-free.
-  const imgCache = new Map();
-  let reqSeq = 0;
+  // Redraw/re-resolve when any cached image finishes decoding.
+  $effect(() => subscribe(() => loadTick++));
 
   const frameUrl = (i) => {
     if (!imagesDir || i < 0 || i >= model.frameCount) return null;
@@ -26,19 +28,10 @@
     return name ? `${imagesDir}/${name}.PNG` : null;
   };
 
-  // Warm the cache for an upcoming frame without touching what's on screen.
-  function prefetch(i) {
-    const url = frameUrl(i);
-    if (!url || imgCache.has(url)) return;
-    const img = new Image();
-    img.onload = () => imgCache.set(url, img);
-    img.src = url;
-  }
-
   // Drop cached images when switching datasets.
   $effect(() => {
     void imagesDir;
-    imgCache.clear();
+    clearImages();
   });
 
   // Mark the view as needing a fit whenever the dataset changes. The draw
@@ -50,43 +43,38 @@
     fitted = false;
   });
 
-  // Resolve the image for the current frame, keeping the previous one visible
-  // while the next decodes so playback doesn't flash a blank background.
+  // Resolve the image for the current frame from the shared cache. While the
+  // next image is still decoding, keep the previous one on screen (no flicker);
+  // during playback the loop won't advance until it's ready, so the picture and
+  // annotations stay in sync. getImage()/imageStatus() are reactive on loads.
   $effect(() => {
+    void loadTick; // re-resolve when a load completes
     const url = frameUrl(frame);
     if (!url) {
       displayImg = null;
       imgStatus = 'none';
+      loading = false;
       return;
     }
-    const cached = imgCache.get(url);
-    if (cached) {
-      displayImg = cached;
+    loadImage(url);
+    for (let k = 1; k <= 15; k++) loadImage(frameUrl(frame + k));
+
+    const img = getImage(url);
+    const st = imageStatus(url);
+    if (img) {
+      displayImg = img;
       imgStatus = 'ok';
-      for (let k = 1; k <= 6; k++) prefetch(frame + k);
-      return;
+      loading = false;
+    } else if (st === 'error') {
+      displayImg = null;
+      imgStatus = 'error';
+      loading = false;
+    } else {
+      // This frame's image is still decoding: keep the previous one on screen
+      // (if any) and surface a loading indicator.
+      imgStatus = displayImg ? 'ok' : 'loading';
+      loading = true;
     }
-    const token = ++reqSeq;
-    imgStatus = displayImg ? 'ok' : 'loading';
-    const image = new Image();
-    image.onload = () => {
-      imgCache.set(url, image);
-      if (token === reqSeq) {
-        displayImg = image;
-        imgStatus = 'ok';
-      }
-    };
-    image.onerror = () => {
-      // A real 404 (e.g. frames past the exported image range): clear the stale
-      // frame and show the note. Valid images never reach here, so playback's
-      // decode gap still keeps the previous frame and stays flicker-free.
-      if (token === reqSeq) {
-        displayImg = null;
-        imgStatus = 'error';
-      }
-    };
-    image.src = url;
-    for (let k = 1; k <= 6; k++) prefetch(frame + k);
   });
 
   const shapes = $derived(model.shapesForFrame(frame));
@@ -323,6 +311,10 @@
     <button class="fit" onclick={fit} title="Fit to view">Fit</button>
   </div>
 
+  {#if loading}
+    <div class="loading-badge"><span class="spinner"></span> Loading frame…</div>
+  {/if}
+
   {#if imgStatus === 'error'}
     <div class="img-note">image missing — showing annotations only</div>
   {:else if imgStatus === 'none'}
@@ -400,5 +392,34 @@
     padding: 4px 10px;
     border-radius: 6px;
     pointer-events: none;
+  }
+  .loading-badge {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--text);
+    background: rgba(10, 13, 19, 0.82);
+    border: 1px solid var(--border);
+    padding: 5px 10px;
+    border-radius: 8px;
+    backdrop-filter: blur(4px);
+    pointer-events: none;
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>

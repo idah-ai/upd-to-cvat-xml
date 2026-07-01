@@ -30,11 +30,16 @@ Opens at http://localhost:5180/.
 
 - Sidebar — pick a dataset (grouped by top-level folder).
 - Player — ◀ ▶ step, ▶/⏸ play, scrubber, ⏮/⏭ jump to ends. Any manual frame
-  change (buttons, keys, or scrubber) pauses playback.
+  change (buttons, keys, or scrubber) pauses playback. The frame counter is
+  0-indexed (`0 / N-1`) to match the "Frame N" label in the right panel.
+- A spinner badge appears while the current frame's image is still decoding.
 - Speed — 1×–5× selector. 1× plays at the video's native frame rate (parsed
-  from the task name, e.g. `..._30fps_...`, defaulting to 30 fps). Playback is
-  time-based, so the on-screen rate matches real speed regardless of how fast
-  frames render.
+  from the task name, e.g. `..._30fps_...`, defaulting to 30 fps).
+- Playback buffers: it won't advance to a frame until that frame's image has
+  decoded, so annotations never run ahead of the picture. It stops on the last
+  frame; pressing play again from the end restarts from the beginning. A shared
+  image cache ([src/lib/imageCache.js](src/lib/imageCache.js)) backs both the
+  renderer and this gating.
 - Keyboard — `←`/`→` step, `Space` play/pause, `Home`/`End` first/last frame.
 - Toggles — `Labels` and `Fill`; the right panel lists per-label counts for the
   current frame plus task metadata.
