@@ -26,7 +26,7 @@ returns ``{points, angle}`` — angle is linearly interpolated for bboxes, 0 for
 polygons):
 
     shape_at(shape_args, frame, kind=...)   -> (points, angle) | None
-    iter_frames(shape_args, kind=...)       -> Iterator[(frame, points, angle)]
+    iter_frames(shape_args, kind=...)       -> Iterator[(frame, points, angle, is_keyframe)]
 """
 
 from __future__ import annotations
@@ -139,8 +139,13 @@ def shape_at(shape_args: dict, frame: int, *, kind: str) -> Optional[tuple[list[
     raise ValueError(f"unsupported kind {kind!r}")
 
 
-def iter_frames(shape_args: dict, *, kind: str) -> Iterator[tuple[int, list[list[float]], float]]:
-    """Yield ``(frame, points, angle)`` for every integer frame in ``[start, end]``.
+def iter_frames(shape_args: dict, *, kind: str) -> Iterator[tuple[int, list[list[float]], float, bool]]:
+    """Yield ``(frame, points, angle, is_keyframe)`` for every integer frame in ``[start, end]``.
+
+    ``is_keyframe`` is True only for frames that are *original IDAH keyframes*;
+    materialised in-betweens and the held pre-/post-roll frames are False. It
+    describes the source data, not CVAT's encoding — callers decide what to do
+    with it (see :func:`converter.write_video_body`).
 
     One flubber interpolator is built per keyframe segment and reused across
     the frames inside it, so polygon morphing stays cheap. Angle is linearly
@@ -152,7 +157,7 @@ def iter_frames(shape_args: dict, *, kind: str) -> Iterator[tuple[int, list[list
 
     # Pre-roll: frames before the first keyframe hold the first keyframe.
     for f in range(start, nums[0]):
-        yield f, _raw(frames[0]), _angle(frames[0])
+        yield f, _raw(frames[0]), _angle(frames[0]), False
 
     # Each segment [nums[i], nums[i+1]) — emit the left keyframe raw, then morph.
     for i in range(len(nums) - 1):
@@ -165,16 +170,16 @@ def iter_frames(shape_args: dict, *, kind: str) -> Iterator[tuple[int, list[list
             if f < start:
                 continue
             if f == f0:
-                yield f, _raw(frames[i]), a0
+                yield f, _raw(frames[i]), a0, True
                 continue
             t = (f - f0) / (f1 - f0)
             if kind == BBOX:
-                yield f, _lerp_points(p0, p1, t), a0 + (a1 - a0) * t
+                yield f, _lerp_points(p0, p1, t), a0 + (a1 - a0) * t, False
             elif kind == POLYGON:
-                yield f, np.asarray(morph(t)).tolist(), 0.0
+                yield f, np.asarray(morph(t)).tolist(), 0.0, False
             else:
                 raise ValueError(f"unsupported kind {kind!r}")
 
-    # Last keyframe and any post-roll up to `end`.
+    # Last keyframe, then any post-roll frames holding it up to `end`.
     for f in range(nums[-1], end + 1):
-        yield f, _raw(frames[-1]), _angle(frames[-1])
+        yield f, _raw(frames[-1]), _angle(frames[-1]), f == nums[-1]

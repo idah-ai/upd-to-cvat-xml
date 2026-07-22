@@ -315,19 +315,82 @@ def _shape_suffix(shape_type: str) -> str:
     return shape_type.split(":", 1)[-1]
 
 
+COORD_DP = 2   # decimal places the CVAT XML carries for box coordinates
+
+
+def _box_xml(frame: int, box: tuple, *, keyframe: int, outside: int) -> str:
+    xtl, ytl, xbr, ybr, rot = box
+    rot_attr = f' rotation="{rot:.2f}"' if rot else ""
+    return (f'    <box frame="{frame}" keyframe="{keyframe}" outside="{outside}" '
+            f'occluded="0" xtl="{xtl:.2f}" ytl="{ytl:.2f}" '
+            f'xbr="{xbr:.2f}" ybr="{ybr:.2f}"{rot_attr} z_order="0">\n    </box>')
+
+
+def _bbox_track_shapes(seq: list, w: int, h: int, *, clamp: bool) -> list:
+    """Per-frame ``(keyframe, box)`` for a bbox track, reproducing CVAT exactly.
+
+    ``seq`` is the materialised :func:`interpolation.iter_frames` output. Anchor
+    frames — the original IDAH keyframes, plus frame 0 so the track starts on
+    time — are rendered from the source geometry and rounded to the precision
+    the XML actually carries. Every in-between is then the linear blend of its
+    *bracketing rounded anchors*, rounded the same way.
+
+    That is exactly what CVAT recomputes: on import it discards the
+    ``keyframe="0"`` shapes and keeps only the anchors *at the precision we
+    wrote*, then re-interpolates between them on export. Deriving in-betweens
+    from the emitted anchors rather than from full-precision source geometry
+    removes the double-rounding (``round(lerp(exact))`` vs
+    ``round(lerp(round(exact)))``, worth up to 1 unit in the last decimal) and
+    also the clamping non-linearity, since anchors are clamped *before* the
+    blend and ``clamp(lerp(a, b)) != lerp(clamp(a), clamp(b))``. The result is a
+    file CVAT returns byte-identical.
+    """
+    rnd = lambda v: round(v, COORD_DP)
+    anchors = [i for i, (_f, _p, _a, is_kf) in enumerate(seq) if is_kf or i == 0]
+    boxes = {i: tuple(rnd(v) for v in
+                      bbox_to_cvat(seq[i][1], seq[i][2], w, h, clamp=clamp))
+             for i in anchors}
+
+    out: list = [None] * len(seq)
+    for i in anchors:
+        out[i] = (1, boxes[i])
+    for lo, hi in zip(anchors, anchors[1:]):
+        f0, f1 = seq[lo][0], seq[hi][0]
+        a, b = boxes[lo], boxes[hi]
+        for i in range(lo + 1, hi):
+            t = (seq[i][0] - f0) / (f1 - f0)
+            out[i] = (0, tuple(rnd(a[k] + (b[k] - a[k]) * t) for k in range(len(a))))
+    for i in range(anchors[-1] + 1, len(seq)):   # trailing frames hold the last anchor
+        out[i] = (0, boxes[anchors[-1]])
+    return out
+
+
 def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
                      clamp: bool = True) -> str:
     """Build the <track> body for one video from its annotations.
 
     Every frame in each track's ``[start, end]`` is materialised using the
     interpolation helper (bbox = linear, polygon = flubber), rather than
-    emitting only keyframes and relying on CVAT's own interpolation — so the
-    exported geometry matches the frontend's interpolation exactly. **Every
-    emitted frame is flagged ``keyframe="1"``**: CVAT only stores keyframe
-    shapes and, on import, discards ``keyframe="0"`` frames and re-interpolates
-    linearly between the real keyframes. Flagging every materialised frame a
-    keyframe is therefore what makes CVAT keep our per-frame (flubber) geometry
-    verbatim instead of throwing it away.
+    emitting only keyframes and relying on CVAT's own interpolation.
+
+    The ``keyframe=`` flag then differs per shape type, because CVAT stores only
+    keyframe shapes — on import it discards ``keyframe="0"`` frames and
+    re-interpolates linearly between the real keyframes:
+
+    - **polygon** — every emitted frame is ``keyframe="1"``. CVAT's polygon
+      interpolation is not flubber, so anything it re-derives would not match
+      the frontend; flagging each frame is what makes it keep our geometry.
+    - **bounding-box** — only the original IDAH keyframes are ``keyframe="1"``;
+      the materialised in-betweens are ``keyframe="0"``. Both sides interpolate
+      boxes linearly, so CVAT rebuilds byte-identical geometry from the
+      keyframes alone, and the track stays cheap to edit in the UI.
+
+    The first emitted shape of a track is always a keyframe regardless: a
+    leading ``keyframe="0"`` would be discarded and the track would start late.
+
+    Bbox in-betweens are computed from the *emitted, rounded* keyframes rather
+    than from full-precision source geometry, so importing and re-exporting the
+    file through CVAT returns it unchanged — see :func:`_bbox_track_shapes`.
 
     The track ``label=`` is the annotation ``category`` (the IDAH tree-path
     *id*, e.g. ``"vehicles/truck"``), used verbatim so it matches the ``id``-
@@ -349,27 +412,37 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
         label = ann.annotation.get("category", "")
         end = sa.get("end", frames[-1]["frame"])
 
-        frame_iter = interp.iter_frames(sa, kind=suffix)
+        seq = list(interp.iter_frames(sa, kind=suffix))
+        if not seq:
+            continue
 
         shapes: list[str] = []
-        last_points = last_angle = None
-        # Every emitted shape is a keyframe. CVAT discards keyframe="0" frames on
-        # import and re-interpolates linearly between the real keyframes, so
-        # marking each materialised frame keyframe="1" is what preserves our
-        # per-frame (flubber) geometry.
-        for frame, points, angle in frame_iter:
-            shapes.append(_frame_shape(suffix, frame, points, w, h,
-                                       keyframe=1, outside=0, angle=angle,
-                                       clamp=clamp))
-            last_points, last_angle = points, angle
+        if suffix == interp.BBOX:
+            # Only the real keyframes are keyframe="1"; the in-betweens are
+            # derived from those emitted anchors so CVAT rebuilds them exactly.
+            emitted = _bbox_track_shapes(seq, w, h, clamp=clamp)
+            for (frame, *_), (keyframe, box) in zip(seq, emitted):
+                shapes.append(_box_xml(frame, box, keyframe=keyframe, outside=0))
+            tail = emitted[-1][1]
+        else:
+            # Polygons keep every frame a keyframe: CVAT's polygon interpolation
+            # is not flubber, so anything it re-derived would not match.
+            for frame, points, angle, _is_kf in seq:
+                shapes.append(_frame_shape(suffix, frame, points, w, h,
+                                           keyframe=1, outside=0, angle=angle,
+                                           clamp=clamp))
+            tail = (seq[-1][1], seq[-1][2])
 
         # Terminate the track with an outside="1" shape one frame past the end,
         # unless the track already runs to the last video frame. CVAT marks the
         # terminating outside shape as a keyframe (keyframe="1").
         if end + 1 <= n_frames - 1:
-            shapes.append(_frame_shape(suffix, end + 1, last_points, w, h,
-                                       keyframe=1, outside=1, angle=last_angle,
-                                       clamp=clamp))
+            if suffix == interp.BBOX:
+                shapes.append(_box_xml(end + 1, tail, keyframe=1, outside=1))
+            else:
+                shapes.append(_frame_shape(suffix, end + 1, tail[0], w, h,
+                                           keyframe=1, outside=1, angle=tail[1],
+                                           clamp=clamp))
 
         blocks.append(
             f'  <track id="{track_id}" label={quoteattr(label)} source="manual">\n'
