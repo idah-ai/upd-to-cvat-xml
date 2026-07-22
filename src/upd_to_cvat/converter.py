@@ -506,14 +506,47 @@ def _shape_suffix(shape_type: str) -> str:
     return shape_type.split(":", 1)[-1]
 
 
+#: IDAH ``occlusion`` values that mean the object is occluded.
+OCCLUSION_VALUES = frozenset({"partial", "full"})
+
+
+def is_occluded(annotation: dict) -> bool:
+    """Whether an IDAH annotation is occluded — CVAT's ``occluded`` flag.
+
+    IDAH stores this as ``annotation.attributes.occlusion``. It is a property of
+    the *annotation*, i.e. of the whole track: the per-frame records carry only
+    ``frame``/``points``/``angle``, so there is no per-frame occlusion to read
+    and every shape of a track inherits the one value. (CVAT does allow it to
+    vary per frame, so this is a real narrowing — but it is the only thing the
+    source data supports.)
+
+    The value is ``"Partial"``, ``"FULL"`` or empty, and is sometimes wrapped in
+    a single-element list (``["Partial"]``), so it is unwrapped and matched
+    case-insensitively.
+
+    Both degrees collapse to ``occluded="1"`` because CVAT's flag is a plain
+    boolean; the Partial/FULL distinction has nowhere to go. Fully-occluded is
+    deliberately *not* mapped to ``outside="1"``: outside means the object is
+    absent from the frame, whereas a FULL-occluded IDAH annotation still carries
+    the box the annotator drew. CVAT's own exports agree — in the reference dump
+    ``outside="1"`` appears only as a track's final terminator.
+    """
+    value = (annotation or {}).get("attributes") or {}
+    value = value.get("occlusion", "") if isinstance(value, dict) else ""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value).strip().lower() in OCCLUSION_VALUES
+
+
 COORD_DP = 2   # decimal places the CVAT XML carries for box coordinates
 
 
-def _box_xml(frame: int, box: tuple, *, keyframe: int, outside: int) -> str:
+def _box_xml(frame: int, box: tuple, *, keyframe: int, outside: int,
+             occluded: int = 0) -> str:
     xtl, ytl, xbr, ybr, rot = box
     rot_attr = f' rotation="{rot:.2f}"' if rot else ""
     return (f'    <box frame="{frame}" keyframe="{keyframe}" outside="{outside}" '
-            f'occluded="0" xtl="{xtl:.2f}" ytl="{ytl:.2f}" '
+            f'occluded="{occluded}" xtl="{xtl:.2f}" ytl="{ytl:.2f}" '
             f'xbr="{xbr:.2f}" ybr="{ybr:.2f}"{rot_attr} z_order="0">\n    </box>')
 
 
@@ -607,6 +640,9 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
             continue
         label = ann.annotation.get("category", "")
         end = sa.get("end", frames[-1]["frame"])
+        # IDAH occlusion is a property of the annotation, so it holds for every
+        # frame of the track — including the terminator (see is_occluded).
+        occluded = int(is_occluded(ann.annotation))
 
         seq = list(interp.iter_frames(sa, kind=suffix))
         if not seq:
@@ -619,7 +655,7 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
             emitted = _bbox_track_shapes(seq, w, h, clamp=clamp)
             for (frame, *_), (keyframe, box) in zip(seq, emitted):
                 shapes.append(_box_xml(frame, box, keyframe=keyframe,
-                                       outside=0))
+                                       outside=0, occluded=occluded))
             tail = emitted[-1][1]
         else:
             # Polygons keep every frame a keyframe: CVAT's polygon interpolation
@@ -627,7 +663,7 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
             for frame, points, angle, _is_kf in seq:
                 shapes.append(_frame_shape(suffix, frame, points, w, h,
                                            keyframe=1, outside=0, angle=angle,
-                                           clamp=clamp))
+                                           clamp=clamp, occluded=occluded))
             tail = (seq[-1][1], seq[-1][2])
 
         # Terminate the track with an outside="1" shape one frame past the end,
@@ -635,11 +671,12 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
         # terminating outside shape as a keyframe (keyframe="1").
         if end + 1 <= n_frames - 1:
             if suffix == interp.BBOX:
-                shapes.append(_box_xml(end + 1, tail, keyframe=1, outside=1))
+                shapes.append(_box_xml(end + 1, tail, keyframe=1, outside=1,
+                                       occluded=occluded))
             else:
                 shapes.append(_frame_shape(suffix, end + 1, tail[0], w, h,
                                            keyframe=1, outside=1, angle=tail[1],
-                                           clamp=clamp))
+                                           clamp=clamp, occluded=occluded))
 
         blocks.append(
             f'  <track id="{track_id}" label={quoteattr(label)} '
@@ -654,8 +691,9 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
 
 def _frame_shape(suffix: str, frame: int, points: list, w: int, h: int, *,
                  keyframe: int, outside: int, angle: float = 0.0,
-                 clamp: bool = True) -> str:
-    common = f'frame="{frame}" keyframe="{keyframe}" outside="{outside}" occluded="0"'
+                 clamp: bool = True, occluded: int = 0) -> str:
+    common = (f'frame="{frame}" keyframe="{keyframe}" outside="{outside}" '
+              f'occluded="{occluded}"')
 
     if suffix == interp.BBOX:
         xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, angle, w, h, clamp=clamp)
@@ -695,9 +733,9 @@ def build_meta_images(*, task_id: int, name: str, size: int, labels_xml: str) ->
 
 
 def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str, *,
-                 clamp: bool = True) -> str | None:
+                 clamp: bool = True, occluded: int = 0) -> str | None:
     """One CVAT image-format shape element, or None for unsupported types."""
-    common = f'label={quoteattr(label)} source="manual" occluded="0"'
+    common = f'label={quoteattr(label)} source="manual" occluded="{occluded}"'
     points = shape_args.get("points", [])
 
     if suffix == "bounding-box":
@@ -730,13 +768,16 @@ def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True) -
     """Shape elements for one image (CVAT image format).
 
     The shape ``label=`` is the annotation ``category`` (the IDAH tree-path
-    *id*) verbatim, matching the ``id``-keyed ``<labels>`` block.
+    *id*) verbatim, matching the ``id``-keyed ``<labels>`` block, and
+    ``occluded=`` comes from the IDAH occlusion attribute (see
+    :func:`is_occluded`).
     """
     out: list[str] = []
     for ann in annotations:
         suffix = _shape_suffix(ann.shape_type)
         label = ann.annotation.get("category", "")
-        el = _image_shape(suffix, ann.shape_args, w, h, label, clamp=clamp)
+        el = _image_shape(suffix, ann.shape_args, w, h, label, clamp=clamp,
+                          occluded=int(is_occluded(ann.annotation)))
         if el is not None:
             out.append(el)
     return "\n".join(out)
