@@ -146,7 +146,8 @@ def test_build_labels_keys_on_id_and_dedupes():
     assert xml.count("<label>") == 2                 # deduped
     assert "<name>veh/truck</name>" in xml
     assert "<name>veh/car</name>" in xml
-    assert "<color>#ff0000</color>" in xml           # first color wins
+    # One colour per label: the first shape type in sorted order that has one.
+    assert "<color>#ff0000</color>" in xml           # from "s1"
     assert "<color>#00ff00</color>" not in xml
 
 
@@ -496,3 +497,83 @@ def test_write_image_body_carries_occlusion_onto_the_shape():
                    {"points": [[0.1, 0.1], [0.5, 0.5]]}, category="veh/truck")
     ann.annotation["attributes"] = {"occlusion": "FULL"}
     assert 'occluded="1"' in c.write_image_body([ann], 100, 100)
+
+
+# ---------------------------------------------------------------------------
+# build_labels — <type> and <color> resolution across shape types
+# ---------------------------------------------------------------------------
+
+def _cfg(**shape_types):
+    """Labeling-Configuration from {shape_type: [(id, color), …]}."""
+    return {st: {"values": [{"id": i, "color": c} for i, c in vals]}
+            for st, vals in shape_types.items()}
+
+
+@pytest.mark.parametrize("shape_type, expected", [
+    ("idah-video:bounding-box", "rectangle"),
+    ("idah-video:polygon", "polygon"),
+    ("idah-image:bounding-box", "rectangle"),
+    ("idah-image:polygon", "polygon"),
+    ("idah-image:line", "polyline"),      # CVAT calls an open path a polyline
+    ("idah-image:ellipse", "ellipse"),
+    ("idah-image:circle", "ellipse"),     # CVAT has no circle primitive
+])
+def test_build_labels_types_track_the_declared_shape(shape_type, expected):
+    xml = c.build_labels(_cfg(**{shape_type: [("veh/car", "#FF0000")]}))
+    assert f"<type>{expected}</type>" in xml
+
+
+def test_build_labels_unknown_shape_type_falls_back_to_any():
+    xml = c.build_labels(_cfg(**{"idah-video:mask": [("veh/car", "#FF0000")]}))
+    assert "<type>any</type>" in xml
+
+
+def test_build_labels_label_in_several_shape_types_is_any():
+    # One CVAT label per name, so a label drawn as both a box and a polygon
+    # cannot be constrained to either.
+    xml = c.build_labels({
+        "idah-video:bounding-box": {"values": [{"id": "a", "color": "#111111"}]},
+        "idah-video:polygon": {"values": [{"id": "a", "color": "#111111"}]},
+    })
+    assert xml.count("<label>") == 1
+    assert "<type>any</type>" in xml
+
+
+def test_build_labels_mixed_declaration_types_are_independent():
+    xml = c.build_labels({
+        "idah-video:bounding-box": {"values": [{"id": "both", "color": "#111111"},
+                                               {"id": "boxonly", "color": "#222222"}]},
+        "idah-video:polygon": {"values": [{"id": "both", "color": "#111111"}]},
+    })
+    both = xml[xml.index("<name>both</name>"):]
+    boxonly = xml[xml.index("<name>boxonly</name>"):]
+    assert "<type>any</type>" in both.split("</label>")[0]
+    assert "<type>rectangle</type>" in boxonly.split("</label>")[0]
+
+
+def test_build_labels_conflicting_colors_resolve_deterministically():
+    # IDAH gives the same label a different colour per shape type; the source is
+    # ambiguous, so the rule only has to be stable — first shape type by name.
+    cfg = {
+        "idah-image:polygon": {"values": [{"id": "car", "color": "#00A6F5"}]},
+        "idah-image:bounding-box": {"values": [{"id": "car", "color": "#FFEC16"}]},
+        "idah-image:line": {"values": [{"id": "car", "color": "#46AF4A"}]},
+    }
+    xml = c.build_labels(cfg)
+    assert "<color>#FFEC16</color>" in xml          # bounding-box sorts first
+    # …and does not depend on how the config dict happens to be ordered.
+    reordered = dict(reversed(list(cfg.items())))
+    assert c.build_labels(reordered) == xml
+
+
+def test_build_labels_skips_empty_colors_when_choosing():
+    xml = c.build_labels({
+        "idah-image:bounding-box": {"values": [{"id": "car", "color": ""}]},
+        "idah-image:polygon": {"values": [{"id": "car", "color": "#00A6F5"}]},
+    })
+    assert "<color>#00A6F5</color>" in xml
+
+
+def test_build_labels_no_color_anywhere_emits_empty():
+    xml = c.build_labels(_cfg(**{"idah-video:bounding-box": [("car", "")]}))
+    assert "<color></color>" in xml

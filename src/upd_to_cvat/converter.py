@@ -178,6 +178,20 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "unnamed"
 
 
+#: IDAH shape_type suffix → CVAT label ``<type>``. The type pins which tool a
+#: label may be drawn with; ``any`` leaves it unconstrained. CVAT has no circle
+#: primitive, so IDAH circles are ellipses here exactly as :func:`_image_shape`
+#: emits them.
+CVAT_LABEL_TYPES = {
+    "bounding-box": "rectangle",
+    "polygon": "polygon",
+    "line": "polyline",
+    "ellipse": "ellipse",
+    "circle": "ellipse",
+    "points": "points",
+}
+
+
 def build_labels(labeling_config: dict) -> str:
     """Build the CVAT <labels> block from a dataset Labeling-Configuration.
 
@@ -187,22 +201,47 @@ def build_labels(labeling_config: dict) -> str:
     — only the ``id`` is unique. CVAT label names must be unique within a task
     and shapes reference labels by name, so keying on the ``id`` keeps every
     category distinct and matches the ``label=`` written on each shape/track.
-    IDAH `properties` are empty in practice, so attributes are emitted empty.
+    IDAH `properties` are empty in practice, so attributes are emitted empty
+    (occlusion rides on CVAT's built-in flag — see :func:`is_occluded`).
+
+    The Labeling-Configuration is keyed by *shape type*, and the same label id
+    routinely appears under several of them — ``"car"`` is declared for
+    bounding-box, polygon, circle, ellipse and line alike. CVAT has one label per
+    name, so those declarations have to be merged:
+
+    - ``<type>`` is the CVAT type of the shape the label is declared for, which
+      constrains it to the right drawing tool. A label declared under *several*
+      shape types cannot be constrained to one and falls back to ``any``.
+    - ``<color>`` is taken from the first shape type in sorted order that
+      supplies one. Where a label is declared once this is simply its colour;
+      where it is declared many times IDAH often gives it a *different* colour
+      per shape type (``"car"`` is ``#FFEC16`` as a box but ``#00A6F5`` as a
+      polygon) and the source is genuinely ambiguous, so the rule only has to be
+      deterministic — previously this fell out of dict ordering and effectively
+      picked at random.
     """
-    seen: dict[str, str] = {}          # label id -> color
-    for shape_cfg in (labeling_config or {}).values():
-        for value in shape_cfg.get("values", []):
+    colors: dict[str, dict[str, str]] = {}   # label id -> {shape suffix: color}
+    types: dict[str, set[str]] = {}          # label id -> CVAT types declared
+
+    for shape_type in sorted(labeling_config or {}):
+        suffix = _shape_suffix(shape_type)
+        for value in (labeling_config[shape_type] or {}).get("values", []):
             vid = value.get("id") or value.get("label")
-            if vid and vid not in seen:
-                seen[vid] = value.get("color", "")
+            if not vid:
+                continue
+            colors.setdefault(vid, {})[suffix] = value.get("color", "")
+            types.setdefault(vid, set()).add(CVAT_LABEL_TYPES.get(suffix, "any"))
 
     lines = ["      <labels>"]
-    for vid, color in seen.items():
+    for vid, palette in colors.items():
+        declared = types[vid]
+        kind = declared.pop() if len(declared) == 1 else "any"
+        color = next((palette[s] for s in sorted(palette) if palette[s]), "")
         lines += [
             "        <label>",
             f"          <name>{escape(vid)}</name>",
             f"          <color>{escape(color)}</color>",
-            "          <type>any</type>",
+            f"          <type>{kind}</type>",
             "          <attributes></attributes>",
             "        </label>",
         ]
