@@ -521,8 +521,10 @@ def is_occluded(annotation: dict) -> bool:
     source data supports.)
 
     The value is ``"Partial"``, ``"FULL"`` or empty, and is sometimes wrapped in
-    a single-element list (``["Partial"]``), so it is unwrapped and matched
-    case-insensitively.
+    a list (``["Partial"]``), so a list counts as occluded when *any* of its
+    entries is — not just the first, which would miss ``["", "FULL"]``. Matching
+    is case-insensitive and tolerates surrounding whitespace, since the casing
+    is inconsistent in practice (``"FULL"`` alongside ``"Partial"``).
 
     Both degrees collapse to ``occluded="1"`` because CVAT's flag is a plain
     boolean; the Partial/FULL distinction has nowhere to go. Fully-occluded is
@@ -531,11 +533,10 @@ def is_occluded(annotation: dict) -> bool:
     the box the annotator drew. CVAT's own exports agree — in the reference dump
     ``outside="1"`` appears only as a track's final terminator.
     """
-    value = (annotation or {}).get("attributes") or {}
-    value = value.get("occlusion", "") if isinstance(value, dict) else ""
-    if isinstance(value, list):
-        value = value[0] if value else ""
-    return str(value).strip().lower() in OCCLUSION_VALUES
+    attributes = (annotation or {}).get("attributes") or {}
+    value = attributes.get("occlusion", "") if isinstance(attributes, dict) else ""
+    values = value if isinstance(value, list) else [value]
+    return any(str(v).strip().lower() in OCCLUSION_VALUES for v in values)
 
 
 COORD_DP = 2   # decimal places the CVAT XML carries for box coordinates

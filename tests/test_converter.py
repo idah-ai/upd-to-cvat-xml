@@ -421,16 +421,31 @@ def test_task_block_carries_its_own_subset():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("value, expected", [
+    # scalars, as stored
     ("Partial", True),
     ("FULL", True),
     ("", False),
-    (["Partial"], True),        # sometimes wrapped in a single-element list
+    # casing is inconsistent in the source data, so matching ignores it
+    ("partial", True),
+    ("full", True),
+    ("Full", True),
+    ("PARTIAL", True),
+    (" Partial ", True),        # and tolerates surrounding whitespace
+    (" full ", True),
+    # sometimes wrapped in a list — every casing shows up there too
+    (["Partial"], True),
+    (["FULL"], True),
+    (["full"], True),
+    (["Full"], True),
     ([""], False),
     ([], False),
-    ("partial", True),          # matched case-insensitively
-    ("full", True),
-    (" Partial ", True),
+    # a multi-entry list counts if *any* entry is occluded, not just the first
+    (["", "FULL"], True),
+    (["FULL", "Partial"], True),
+    (["", ""], False),
+    # anything else is not occlusion
     ("None", False),
+    ("unknown", False),
     (None, False),
 ])
 def test_is_occluded_handles_every_stored_value_shape(value, expected):
