@@ -313,3 +313,104 @@ def test_frame_shape_bbox_emits_rotation_only_when_nonzero():
                              keyframe=1, outside=0, angle=math.pi / 2)
     assert "rotation=" not in plain
     assert 'rotation="90.00"' in rotated
+
+
+# ---------------------------------------------------------------------------
+# Export levels — level_for / _task_block / build_meta_project / build_meta_job
+# ---------------------------------------------------------------------------
+
+def test_level_follows_the_deepest_active_filter():
+    assert c.level_for(None, None) == c.PROJECT
+    assert c.level_for("ds-1", None) == c.TASK
+    assert c.level_for(None, "e-1") == c.JOB
+    assert c.level_for("ds-1", "e-1") == c.JOB       # entry wins over dataset
+
+
+def test_task_block_has_segments_but_no_labels():
+    # A project declares its labels once, at project level — never per task.
+    xml = c._task_block(task_id=3, name="clip", size=51, mode="interpolation",
+                        width=640, height=480)
+    assert "<labels>" not in xml
+    assert "<segments>" in xml
+    assert "<id>3</id>" in xml
+    assert "<source>clip</source>" in xml
+
+
+def test_task_block_frame_range_stays_task_local():
+    # Bodies use project-wide frame numbers, but <start_frame>/<stop_frame> of
+    # each task stay 0-based — that is what CVAT itself emits.
+    xml = c._task_block(task_id=1, name="c", size=46, mode="interpolation",
+                        width=1, height=1)
+    assert "<start_frame>0</start_frame>" in xml
+    assert "<stop_frame>45</stop_frame>" in xml
+
+
+def test_task_block_omits_original_size_for_image_tasks():
+    xml = c._task_block(task_id=0, name="ds", size=4, mode="annotation")
+    assert "<original_size>" not in xml
+    assert "<source>" not in xml
+
+
+def test_build_meta_project_nests_tasks_and_hoists_labels():
+    xml = c.build_meta_project(project_id=0, name="proj",
+                               task_blocks=["<task/>", "<task/>"],
+                               labels_xml="LBL")
+    assert "<project>" in xml and "</project>" in xml
+    assert xml.count("<task/>") == 2
+    assert "<subsets>default</subsets>" in xml
+    assert xml.index("LBL") < xml.index("</project>")   # labels are the project's
+
+
+def test_build_meta_job_has_no_name_and_hoists_original_size():
+    # A job is a frame range, not a media file: no <name>/<source>, and CVAT
+    # writes <original_size> *outside* <job>, after <dumped>.
+    xml = c.build_meta_job(job_id=9, size=51, labels_xml="LBL",
+                           mode="interpolation", width=640, height=480)
+    assert "<name>" not in xml and "<source>" not in xml
+    assert "<id>9</id>" in xml
+    assert "<stop_frame>50</stop_frame>" in xml
+    assert xml.index("</job>") < xml.index("<original_size>")
+
+
+def test_build_meta_job_omits_original_size_for_image_jobs():
+    xml = c.build_meta_job(job_id=0, size=4, labels_xml="L", mode="annotation")
+    assert "<original_size>" not in xml
+
+
+# ---------------------------------------------------------------------------
+# write_video_body — project-level offsets
+# ---------------------------------------------------------------------------
+
+def test_write_video_body_tags_tracks_for_project_level():
+    anns = [make_ann("idah-video:bounding-box", _bbox_track_args(), category="a")]
+    plain = c.write_video_body(anns, 100, 100, n_frames=10)
+    tagged = c.write_video_body(anns, 100, 100, n_frames=10, track_id_start=7,
+                                extra_attrs=' task_id="2" subset="clip-a"')
+
+    assert 'id="7"' in tagged and 'task_id="2"' in tagged
+    assert 'subset="clip-a"' in tagged
+    # Only the track element changes — frames stay task-local (each subset is
+    # an independent CVAT task starting at frame 0) and geometry is untouched.
+    frames = lambda b: [int(f) for f in re.findall(r'(?<!key)frame="(\d+)"', b)]
+    assert frames(plain) == frames(tagged)
+    assert (re.findall(r'xtl="([\d.]+)"', plain)
+            == re.findall(r'xtl="([\d.]+)"', tagged))
+
+
+def test_build_meta_project_lists_every_subset():
+    # CVAT creates one task per subset on import, so <subsets> must name them all.
+    xml = c.build_meta_project(project_id=0, name="p", task_blocks=["<task/>"],
+                               labels_xml="L", subsets=["clip_a", "clip_b"])
+    assert "<subsets>clip_a\nclip_b</subsets>" in xml
+
+
+def test_build_meta_project_defaults_to_single_default_subset():
+    xml = c.build_meta_project(project_id=0, name="p", task_blocks=[],
+                               labels_xml="L")
+    assert "<subsets>default</subsets>" in xml
+
+
+def test_task_block_carries_its_own_subset():
+    xml = c._task_block(task_id=1, name="c", size=5, mode="interpolation",
+                        subset="clip_a", width=1, height=1)
+    assert "<subset>clip_a</subset>" in xml

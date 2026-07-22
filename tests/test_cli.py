@@ -17,7 +17,8 @@ def test_defaults():
     assert args.output == "cvat-export"
     assert args.with_images is False
     assert args.clamp is True                 # clamp on by default
-    assert args.dataset is None
+    assert args.dataset_id is None
+    assert args.entry_id is None
 
 
 def test_upd_is_required():
@@ -33,23 +34,25 @@ def test_no_clamp_disables_clamping():
     assert parse(["--upd", "x", "--no-clamp"]).clamp is False
 
 
-def test_output_and_dataset_overrides():
-    args = parse(["--upd", "x", "--output", "out", "--dataset", "ds-1"])
+def test_output_and_id_filter_overrides():
+    args = parse(["--upd", "x", "--output", "out", "--dataset-id", "ds-1",
+                  "--entry-id", "e-1"])
     assert args.output == "out"
-    assert args.dataset == "ds-1"
+    assert args.dataset_id == "ds-1"
+    assert args.entry_id == "e-1"
 
 
 def test_main_delegates_to_run(monkeypatch):
     calls = {}
 
-    def fake_run(upd_path, output, *, with_images, dataset_filter, clamp):
+    def fake_run(upd_path, output, *, with_images, dataset_id, entry_id, clamp):
         calls.update(upd_path=upd_path, output=output, with_images=with_images,
-                     dataset_filter=dataset_filter, clamp=clamp)
+                     dataset_id=dataset_id, entry_id=entry_id, clamp=clamp)
 
     monkeypatch.setattr(cli, "run", fake_run)
     cli.main(["--upd", "in.upd", "--output", "out", "--with-images",
-              "--no-clamp", "--dataset", "d1"])
+              "--no-clamp", "--dataset-id", "d1"])
     assert calls == {
         "upd_path": "in.upd", "output": "out", "with_images": True,
-        "dataset_filter": "d1", "clamp": False,
+        "dataset_id": "d1", "entry_id": None, "clamp": False,
     }

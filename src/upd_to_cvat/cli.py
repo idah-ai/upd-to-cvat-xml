@@ -21,15 +21,24 @@ def build_parser() -> argparse.ArgumentParser:
                         "default every point is clipped into [0, width] × "
                         "[0, height] since IDAH normalised points can drift "
                         "outside [0, 1]; pass this to keep the raw coordinates.")
-    p.add_argument("--dataset", default=None, help="Optional dataset-id filter.")
+    p.add_argument("--dataset-id", dest="dataset_id", default=None,
+                   help="Export only this dataset, at CVAT task level: one "
+                        "annotations.xml per entry (video) or per dataset "
+                        "(image). Without any filter the export is at project "
+                        "level instead — one annotations.xml per dataset, with "
+                        "every entry as a <task> and project-wide frame "
+                        "numbering.")
+    p.add_argument("--entry-id", dest="entry_id", default=None,
+                   help="Export only this entry, at CVAT job level: one "
+                        "annotations.xml with a <job> meta block.")
     return p
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     run(args.upd, args.output,
-        with_images=args.with_images, dataset_filter=args.dataset,
-        clamp=args.clamp)
+        with_images=args.with_images, dataset_id=args.dataset_id,
+        entry_id=args.entry_id, clamp=args.clamp)
 
 
 if __name__ == "__main__":

@@ -5,22 +5,65 @@ files into [CVAT 1.1](https://opencv.github.io/cvat/docs/manual/advanced/xml_for
 annotation packages. The output format is selected automatically per dataset
 `modality`:
 
-- **`idah-video`** → *CVAT for video 1.1*: one CVAT task folder per video entry,
-  with annotation tracks.
+- **`idah-video`** → *CVAT for video 1.1*: one video per entry, with annotation
+  tracks.
   - Supported shapes: bounding box and polygon.
 - **`idah-image`** → *CVAT for images 1.1*: the whole dataset as a single task,
   with one image per entry.
   - Supported shapes: bounding box, polygon, ellipse, circle, and line.
 
-```
-# idah-video
-cvat-export/<dataset>/<entry>_<media-id>/annotations.xml
-                                         images/frame_000000.PNG   # --with-images
+## Export levels
 
-# idah-image
-cvat-export/<dataset>/annotations.xml
-                      images/<name>.jpg                            # --with-images
+CVAT dumps annotations at three levels — **project**, **task** and **job** —
+which differ in their `<meta>` block and, at project level, in how frames are
+numbered. IDAH has only two levels (dataset → entry), so they map like this:
+
+| IDAH | CVAT (`idah-video`) | CVAT (`idah-image`) |
+| ---- | ------------------- | ------------------- |
+| dataset | project | project *and* its single task |
+| entry | task, with one job | one `<image>` |
+
+The level follows the filter — the deeper you filter, the lower the level:
+
+| Filter | Level | Output |
+| ------ | ----- | ------ |
+| *(none)* | project | one `annotations.xml` per dataset, all entries merged |
+| `--dataset-id` | task | one per entry (video) / one per dataset (image) |
+| `--entry-id` | job | one `annotations.xml` for that entry |
+
 ```
+# project (default)
+cvat-export/project_<dataset>/annotations.xml
+                              images/<entry>/frame_000000.PNG      # --with-images
+
+# task — --dataset-id
+cvat-export/<dataset>/<entry>_<media-id>/annotations.xml           # idah-video
+                                         images/frame_000000.PNG   # --with-images
+cvat-export/<dataset>/annotations.xml                              # idah-image
+                      images/<name>.jpg                            # --with-images
+
+# job — --entry-id
+cvat-export/<dataset>/job_<entry>_<media-id>/annotations.xml
+                                             images/frame_000000.PNG
+```
+
+### Subsets at project level
+
+At **project** level each entry gets its own **subset**, and its frames live in
+`images/<subset>/`. This matters on import: **CVAT creates one task per subset**,
+and it ignores the `<meta><project><tasks>` list when reconstructing tasks. A
+project whose tasks all sit in one subset therefore collapses back into a single
+task on import — which is what CVAT's *own* project export produces, so a real
+CVAT project dump does not round-trip either. Giving each entry a distinct subset
+is what makes an *N*-entry dataset come back as *N* tasks.
+
+Because each subset is an independent task, frames are numbered per task
+(starting at 0), not project-wide. Track ids stay unique across the whole
+project, which also makes them unique within each task.
+
+> When zipping the export for CVAT, use `zip -r -X out.zip <dir>` rather than
+> Finder — Finder adds `__MACOSX/._*` resource-fork entries that double the file
+> count.
 
 ---
 
@@ -54,14 +97,17 @@ pip install .                 # installs this package + the dependencies
 ## Usage
 
 ```bash
-# annotations only
+# annotations only — project level, every dataset
 upd-to-cvat --upd idah-export.upd --output cvat-export
 
 # also extract every video frame as PNG
 upd-to-cvat --upd idah-export.upd --output cvat-export --with-images
 
-# limit to a single dataset
-upd-to-cvat --upd idah-export.upd --output cvat-export --dataset <dataset-id>
+# task level: one dataset, one annotations.xml per entry
+upd-to-cvat --upd idah-export.upd --output cvat-export --dataset-id <dataset-id>
+
+# job level: a single entry
+upd-to-cvat --upd idah-export.upd --output cvat-export --entry-id <entry-id>
 ```
 
 | Flag              | Description                                                            |
@@ -70,7 +116,8 @@ upd-to-cvat --upd idah-export.upd --output cvat-export --dataset <dataset-id>
 | `--output`        | Output root directory (default `cvat-export`).                        |
 | `--with-images`   | Video: extract frames as `images/frame_%06d.PNG`. Images: copy the source images into `images/`. |
 | `--no-clamp`      | Keep raw coordinates instead of clamping each shape to the media bounds. By default shapes are clipped to `[0, width] × [0, height]`, since normalised IDAH points can drift slightly outside `[0, 1]`. |
-| `--dataset`       | Optional dataset-id filter.                                          |
+| `--dataset-id`    | Export only this dataset, at **task** level.                          |
+| `--entry-id`      | Export only this entry, at **job** level.                             |
 
 Equivalent module form: `python -m upd_to_cvat --upd …`.
 
@@ -79,7 +126,9 @@ Equivalent module form: `python -m upd_to_cvat --upd …`.
 ```python
 from upd_to_cvat import run
 
-run("idah-export.upd", "cvat-export", with_images=False)
+run("idah-export.upd", "cvat-export", with_images=False)     # project level
+run("idah-export.upd", "cvat-export", dataset_id="…")        # task level
+run("idah-export.upd", "cvat-export", entry_id="…")          # job level
 ```
 
 ## Tests

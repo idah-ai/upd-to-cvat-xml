@@ -12,17 +12,28 @@ this split via the dataset ``modality`` column (``idah-image`` / ``idah-video``)
 
 Both modalities are supported:
 
-- ``idah-video`` → *CVAT for video 1.1*. Each entry is one video, so one entry
-  → one task folder, with ``<track>``s::
-
-      <output>/<dataset>/<entry>_<media-id>/annotations.xml
-                                            images/frame_000000.PNG   (--with-images)
-
+- ``idah-video`` → *CVAT for video 1.1*. Each entry is one video, with
+  ``<track>``s.
 - ``idah-image`` → *CVAT for images 1.1*. The whole dataset is one task, one
-  ``<image>`` per entry::
+  ``<image>`` per entry.
 
-      <output>/<dataset>/annotations.xml
-                         images/<name>.jpg                            (--with-images)
+CVAT dumps annotations at three levels — project, task and job — which differ in
+their ``<meta>`` block and in how the media is laid out. IDAH has only two levels
+(dataset → entry), so the level is chosen by how deeply the export is filtered;
+see :data:`PROJECT` and :func:`level_for` for the mapping::
+
+    (no filter)      project   <output>/project_<dataset>/annotations.xml
+                                                          images/<subset>/frame_000000.PNG
+    --dataset-id     task      <output>/<dataset>/<entry>_<media-id>/annotations.xml
+                                                                     images/frame_000000.PNG
+    --entry-id       job       <output>/<dataset>/job_<entry>_<media-id>/annotations.xml
+                                                                        images/frame_000000.PNG
+
+At project level each entry gets its own *subset*, since CVAT creates one task
+per subset on import — see :func:`export_video_project`.
+
+For ``idah-image`` the dataset is a single task at every level, so the task- and
+job-level paths lose the per-entry folder and the images are ``<name>.jpg``.
 
 CVAT stores absolute pixel coordinates while IDAH stores normalised [0, 1]
 points, so each video/image is probed with PyAV (``av``) for its dimensions
@@ -40,6 +51,7 @@ import sys
 import tempfile
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape, quoteattr
@@ -55,15 +67,31 @@ from . import interpolation as interp
 # ---------------------------------------------------------------------------
 
 def probe_video(path: str) -> tuple[int, int, int]:
-    """Return (width, height, n_frames) for a video file via PyAV."""
+    """Return (width, height, n_frames) for a video file via PyAV.
+
+    ``stream.frames`` is the container's *metadata* count. It is 0 for some
+    containers, and for others (notably the ``.ts`` transport streams IDAH
+    exports) it is simply wrong — one sample reports 3193 frames where only 3081
+    decode. An overstated count is not cosmetic: ``<size>`` in the ``<meta>``
+    then promises CVAT more frames than the export ships, and the track
+    terminator is placed past the end of the video.
+
+    So the metadata count is cross-checked against ``duration × average_rate``,
+    which is independent of it, and only trusted when the two agree. Otherwise
+    the frames are decode-counted — expensive, but it is the only way to be
+    sure, and it is what ``--with-images`` will produce anyway.
+    """
     with av.open(path) as container:
         stream = container.streams.video[0]
         width = stream.codec_context.width
         height = stream.codec_context.height
         n_frames = stream.frames
-    # stream.frames is the container's metadata count and is 0 for some
-    # containers; fall back to decode-counting the actual frames.
-    if n_frames <= 0:
+        estimate = None
+        if container.duration and stream.average_rate:
+            estimate = (container.duration / 1_000_000) * float(stream.average_rate)
+
+    # Allow a frame of slack: duration/rate are themselves rounded.
+    if n_frames <= 0 or (estimate is not None and abs(n_frames - estimate) > 1):
         n_frames = _count_frames(path)
     return width, height, n_frames
 
@@ -182,10 +210,15 @@ def build_labels(labeling_config: dict) -> str:
     return "\n".join(lines)
 
 
+def _now() -> str:
+    """UTC timestamp in the format CVAT writes into <created>/<dumped>."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
+
+
 def build_meta(*, task_id: int, name: str, size: int, labels_xml: str,
                width: int, height: int, source: str) -> str:
-    """Emit the CVAT <meta> block (video / interpolation mode)."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
+    """Emit the task-level CVAT <meta> block (video / interpolation mode)."""
+    now = _now()
     return f"""  <meta>
     <task>
       <id>{task_id}</id>
@@ -200,6 +233,19 @@ def build_meta(*, task_id: int, name: str, size: int, labels_xml: str,
       <start_frame>0</start_frame>
       <stop_frame>{max(size - 1, 0)}</stop_frame>
       <frame_filter></frame_filter>
+      <segments>
+        <segment>
+          <id>{task_id}</id>
+          <start>0</start>
+          <stop>{max(size - 1, 0)}</stop>
+          <url></url>
+        </segment>
+      </segments>
+      <owner>
+        <username></username>
+        <email></email>
+      </owner>
+      <assignee></assignee>
 {labels_xml}
       <original_size>
         <width>{width}</width>
@@ -209,6 +255,151 @@ def build_meta(*, task_id: int, name: str, size: int, labels_xml: str,
     </task>
     <dumped>{now}</dumped>
   </meta>"""
+
+
+def _task_block(*, task_id: int, name: str, size: int, mode: str,
+                subset: str = "default", width: int | None = None,
+                height: int | None = None, indent: int = 8) -> str:
+    """One <task> element of a project-level <tasks> list.
+
+    Unlike the task-level :func:`build_meta`, this block carries no ``<labels>``
+    — a CVAT project declares its label set once, at project level — and it does
+    carry ``<segments>``, since a project dump describes the job layout of each
+    of its tasks.
+
+    ``subset`` is what actually reconstitutes this task on import: CVAT creates
+    one task per *subset*, so each task needs its own (see
+    :func:`export_video_project`). ``width``/``height`` are omitted for image
+    tasks, which have no single original size (each ``<image>`` carries its own).
+    """
+    p = " " * indent
+    now = _now()
+    stop = max(size - 1, 0)
+    original_size = "" if width is None else (
+        f"{p}  <original_size>\n"
+        f"{p}    <width>{width}</width>\n"
+        f"{p}    <height>{height}</height>\n"
+        f"{p}  </original_size>\n"
+        f"{p}  <source>{escape(name)}</source>\n"
+    )
+    return (
+        f"{p}<task>\n"
+        f"{p}  <id>{task_id}</id>\n"
+        f"{p}  <name>{escape(name)}</name>\n"
+        f"{p}  <size>{size}</size>\n"
+        f"{p}  <mode>{mode}</mode>\n"
+        f"{p}  <overlap>0</overlap>\n"
+        f"{p}  <bugtracker></bugtracker>\n"
+        f"{p}  <created>{now}</created>\n"
+        f"{p}  <updated>{now}</updated>\n"
+        f"{p}  <subset>{escape(subset)}</subset>\n"
+        f"{p}  <start_frame>0</start_frame>\n"
+        f"{p}  <stop_frame>{stop}</stop_frame>\n"
+        f"{p}  <frame_filter></frame_filter>\n"
+        f"{p}  <segments>\n"
+        f"{p}    <segment>\n"
+        f"{p}      <id>{task_id}</id>\n"
+        f"{p}      <start>0</start>\n"
+        f"{p}      <stop>{stop}</stop>\n"
+        f"{p}      <url></url>\n"
+        f"{p}    </segment>\n"
+        f"{p}  </segments>\n"
+        f"{p}  <owner>\n"
+        f"{p}    <username></username>\n"
+        f"{p}    <email></email>\n"
+        f"{p}  </owner>\n"
+        f"{p}  <assignee></assignee>\n"
+        f"{original_size}"
+        f"{p}</task>"
+    )
+
+
+def build_meta_project(*, project_id: int, name: str, task_blocks: list[str],
+                       labels_xml: str, subsets: list[str] | None = None) -> str:
+    """Emit the project-level CVAT <meta> block.
+
+    The label set lives on the ``<project>`` (not on each ``<task>``).
+    ``<subsets>`` is a newline-separated list; CVAT creates one task per subset
+    on import, so it must name every task's subset.
+    """
+    now = _now()
+    tasks = "\n".join(task_blocks)
+    subsets_text = escape("\n".join(subsets or ["default"]))
+    return f"""  <meta>
+    <project>
+      <id>{project_id}</id>
+      <name>{escape(name)}</name>
+      <bugtracker></bugtracker>
+      <created>{now}</created>
+      <updated>{now}</updated>
+      <tasks>
+{tasks}
+      </tasks>
+      <subsets>{subsets_text}</subsets>
+      <owner>
+        <username></username>
+        <email></email>
+      </owner>
+      <assignee></assignee>
+{labels_xml}
+    </project>
+    <dumped>{now}</dumped>
+  </meta>"""
+
+
+def build_meta_job(*, job_id: int, size: int, labels_xml: str, mode: str,
+                   width: int | None = None, height: int | None = None) -> str:
+    """Emit the job-level CVAT <meta> block.
+
+    A job dump differs from a task dump in three ways, all reproduced here:
+    there is no ``<name>``/``<source>`` (a job is a frame range, not a media
+    file), and ``<original_size>`` sits *outside* ``<job>``, after ``<dumped>``.
+    """
+    now = _now()
+    stop = max(size - 1, 0)
+    original_size = "" if width is None else (
+        f"    <original_size>\n"
+        f"      <width>{width}</width>\n"
+        f"      <height>{height}</height>\n"
+        f"    </original_size>\n"
+    )
+    return f"""  <meta>
+    <job>
+      <id>{job_id}</id>
+      <size>{size}</size>
+      <mode>{mode}</mode>
+      <overlap>0</overlap>
+      <bugtracker></bugtracker>
+      <created>{now}</created>
+      <updated>{now}</updated>
+      <subset>default</subset>
+      <start_frame>0</start_frame>
+      <stop_frame>{stop}</stop_frame>
+      <frame_filter></frame_filter>
+      <segments>
+        <segment>
+          <id>{job_id}</id>
+          <start>0</start>
+          <stop>{stop}</stop>
+          <url></url>
+        </segment>
+      </segments>
+      <owner>
+        <username></username>
+        <email></email>
+      </owner>
+      <assignee></assignee>
+{labels_xml}
+    </job>
+    <dumped>{now}</dumped>
+{original_size}  </meta>"""
+
+
+def _document(meta: str, body: str) -> str:
+    """Wrap a <meta> block and a body in the CVAT 1.1 <annotations> document."""
+    return ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<annotations>\n  <version>1.1</version>\n'
+            f'{meta}\n{body}\n</annotations>\n')
 
 
 def _clamp(v: float, hi: float) -> float:
@@ -366,7 +557,8 @@ def _bbox_track_shapes(seq: list, w: int, h: int, *, clamp: bool) -> list:
 
 
 def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
-                     clamp: bool = True) -> str:
+                     clamp: bool = True, track_id_start: int = 0,
+                     extra_attrs: str = "") -> str:
     """Build the <track> body for one video from its annotations.
 
     Every frame in each track's ``[start, end]`` is materialised using the
@@ -395,9 +587,13 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
     The track ``label=`` is the annotation ``category`` (the IDAH tree-path
     *id*, e.g. ``"vehicles/truck"``), used verbatim so it matches the ``id``-
     keyed ``<labels>`` block — CVAT rejects tracks whose label is not declared.
+
+    ``track_id_start`` and ``extra_attrs`` exist for the project level, where
+    track ids must stay unique across every task in the project and each track
+    carries the ``task_id=``/``subset=`` naming the task it belongs to.
     """
     blocks: list[str] = []
-    track_id = 0
+    track_id = track_id_start
 
     for ann in annotations:
         suffix = _shape_suffix(ann.shape_type)
@@ -422,7 +618,8 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
             # derived from those emitted anchors so CVAT rebuilds them exactly.
             emitted = _bbox_track_shapes(seq, w, h, clamp=clamp)
             for (frame, *_), (keyframe, box) in zip(seq, emitted):
-                shapes.append(_box_xml(frame, box, keyframe=keyframe, outside=0))
+                shapes.append(_box_xml(frame, box, keyframe=keyframe,
+                                       outside=0))
             tail = emitted[-1][1]
         else:
             # Polygons keep every frame a keyframe: CVAT's polygon interpolation
@@ -445,7 +642,8 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
                                            clamp=clamp))
 
         blocks.append(
-            f'  <track id="{track_id}" label={quoteattr(label)} source="manual">\n'
+            f'  <track id="{track_id}" label={quoteattr(label)} '
+            f'source="manual"{extra_attrs}>\n'
             + "\n".join(shapes)
             + "\n  </track>"
         )
@@ -545,74 +743,236 @@ def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True) -
 
 
 # ---------------------------------------------------------------------------
+# Export levels
+# ---------------------------------------------------------------------------
+
+PROJECT, TASK, JOB = "project", "task", "job"
+
+#: How IDAH maps onto the three CVAT export levels.
+#:
+#: IDAH has two levels (dataset → entry) and CVAT has three
+#: (project → task → job), so the mapping is modality-dependent:
+#:
+#: - ``idah-video``: dataset = project, entry = task, and one job per task
+#:   (an entry is a single video, which CVAT segments into exactly one job).
+#: - ``idah-image``: dataset = project *and* its single task, entry = image;
+#:   a job is then a frame range over that task.
+#:
+#: The level follows the filter — the deeper you filter, the lower the level:
+#:
+#: ===================  ========  ================================================
+#: filter               level     output
+#: ===================  ========  ================================================
+#: (none)               project   one XML per dataset, all entries merged
+#: ``--dataset-id``     task      one XML per entry (video) / per dataset (image)
+#: ``--entry-id``       job       one XML for that entry
+#: ===================  ========  ================================================
+
+
+def level_for(dataset_id: str | None, entry_id: str | None) -> str:
+    """The export level implied by the active filters (deepest filter wins)."""
+    if entry_id:
+        return JOB
+    if dataset_id:
+        return TASK
+    return PROJECT
+
+
+# ---------------------------------------------------------------------------
 # Export driver
 # ---------------------------------------------------------------------------
 
-def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
-                       with_images: bool, clamp: bool = True) -> None:
+@contextmanager
+def _entry_media(upd, entry):
+    """Yield a filesystem path to an entry's media blob, or None if missing.
+
+    The blob lives inside the UPD file, but PyAV needs a real path, so it is
+    spilled to a temp file for the duration of the block.
+    """
     media = upd.medias.get(entry.local_media_id)
     if media is None or media.blob_data is None:
         print(f"  ! entry {entry.id}: media missing, skipping")
+        yield None
         return
-
-    entry_name = entry.metadata.get("Name") or entry.local_media_id
     suffix = Path(entry.local_media_id).suffix or ".mp4"
-
     with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
         tmp.write(media.blob_data)
         tmp.flush()
-        width, height, n_frames = probe_video(tmp.name)
+        yield tmp.name
 
-        annotations = upd.annotations.for_entry(entry.id)
+
+def _entry_name(entry) -> str:
+    return entry.metadata.get("Name") or entry.local_media_id
+
+
+def _entry_folder(entry) -> str:
+    """Folder name for one entry.
+
+    Several entries can share the same human Name (same source video); the media
+    id is unique, so fold it in to keep the folders distinct.
+    """
+    return (f"{_safe_name(Path(_entry_name(entry)).stem)}"
+            f"_{Path(entry.local_media_id).stem}")
+
+
+def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
+                       with_images: bool, clamp: bool = True,
+                       level: str = TASK) -> None:
+    """Export one idah-video entry as a task-level or job-level CVAT package.
+
+    Both levels describe the same single video with the same 0-based frame
+    numbering and the same ``<track>`` body; only the ``<meta>`` block differs
+    (see :func:`build_meta` and :func:`build_meta_job`).
+    """
+    with _entry_media(upd, entry) as media_path:
+        if media_path is None:
+            return
+
+        name = _entry_name(entry)
+        width, height, n_frames = probe_video(media_path)
+
         labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
-        meta = build_meta(
-            task_id=task_id, name=entry_name, size=n_frames,
-            labels_xml=labels_xml, width=width, height=height, source=entry_name,
-        )
-        body = write_video_body(annotations, width, height, n_frames,
-                                clamp=clamp)
+        if level == JOB:
+            meta = build_meta_job(job_id=task_id, size=n_frames,
+                                  labels_xml=labels_xml, mode="interpolation",
+                                  width=width, height=height)
+        else:
+            meta = build_meta(task_id=task_id, name=name, size=n_frames,
+                              labels_xml=labels_xml, width=width, height=height,
+                              source=name)
 
-        xml = (f'<?xml version="1.0" encoding="utf-8"?>\n'
-               f'<annotations>\n  <version>1.1</version>\n'
-               f'{meta}\n{body}\n</annotations>\n')
+        body = write_video_body(upd.annotations.for_entry(entry.id),
+                                width, height, n_frames, clamp=clamp)
 
-        # Several entries can share the same human Name (same source video);
-        # the media id is unique, so fold it in to keep task folders distinct.
-        folder = f"{_safe_name(Path(entry_name).stem)}_{Path(entry.local_media_id).stem}"
+        folder = _entry_folder(entry)
+        if level == JOB:
+            folder = f"job_{folder}"
         task_dir = out_dir / _safe_name(ds.name) / folder
         task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / "annotations.xml").write_text(xml, encoding="utf-8")
+        (task_dir / "annotations.xml").write_text(_document(meta, body),
+                                                  encoding="utf-8")
 
         n_tracks = body.count("<track ")
-        print(f"  [{entry_name}] {width}x{height}, {n_frames} frames, {n_tracks} tracks")
+        print(f"  [{name}] {width}x{height}, {n_frames} frames, {n_tracks} tracks")
 
         if with_images:
-            extract_frames(tmp.name, task_dir / "images", total=n_frames)
+            extract_frames(media_path, task_dir / "images", total=n_frames)
 
 
-def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: bool,
+def export_video_project(upd, ds, entries: list, out_dir: Path, *,
+                         project_id: int, with_images: bool,
                          clamp: bool = True) -> None:
-    """Export an idah-image dataset to a single CVAT 'for images 1.1' task.
+    """Export a whole idah-video dataset as one project-level CVAT package.
 
-    All entries become ``<image>`` elements in one ``annotations.xml`` (the CVAT
-    images convention), optionally alongside an ``images/`` folder.
+    Every entry becomes a ``<task>`` inside ``<meta><project><tasks>`` *and* its
+    own **subset**, because a subset is the only thing CVAT reconstitutes a task
+    from on import. The ``<tasks>`` list is descriptive metadata that the
+    importer ignores, so a project whose tasks all sit in one subset (which is
+    what CVAT's own project dump emits) collapses back into a single task —
+    giving each entry a distinct subset is what makes the round trip preserve
+    all N tasks.
+
+    Frames are therefore numbered *per task* (each subset is an independent task
+    that starts at frame 0) and each task's frames live in their own
+    ``images/<subset>/`` folder. Track ids stay unique across the whole project,
+    which also makes them unique within every task.
+    """
+    labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
+    project_dir = out_dir / f"project_{_safe_name(ds.name)}"
+
+    task_blocks: list[str] = []
+    bodies: list[str] = []
+    subsets: list[str] = []
+    task_id = track_id = total_frames = 0
+
+    for entry in entries:
+        with _entry_media(upd, entry) as media_path:
+            if media_path is None:
+                continue
+
+            name = _entry_name(entry)
+            # The subset doubles as a directory name and must be unique: several
+            # entries can share the same human Name, so disambiguate on collision.
+            subset = _safe_name(Path(name).stem)
+            if subset in subsets:
+                subset = _entry_folder(entry)
+            subsets.append(subset)
+
+            width, height, n_frames = probe_video(media_path)
+
+            task_blocks.append(_task_block(
+                task_id=task_id, name=name, size=n_frames, mode="interpolation",
+                subset=subset, width=width, height=height,
+            ))
+            body = write_video_body(
+                upd.annotations.for_entry(entry.id), width, height, n_frames,
+                clamp=clamp, track_id_start=track_id,
+                extra_attrs=f' task_id="{task_id}" subset={quoteattr(subset)}',
+            )
+            n_tracks = body.count("<track ")
+            if body:
+                bodies.append(body)
+
+            print(f"  [{name}] {width}x{height}, {n_frames} frames, "
+                  f"{n_tracks} tracks  → subset {subset!r}")
+
+            if with_images:
+                extract_frames(media_path, project_dir / "images" / subset,
+                               total=n_frames)
+
+            task_id += 1
+            track_id += n_tracks
+            total_frames += n_frames
+
+    meta = build_meta_project(project_id=project_id, name=ds.name,
+                              task_blocks=task_blocks, labels_xml=labels_xml,
+                              subsets=subsets)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "annotations.xml").write_text(
+        _document(meta, "\n".join(bodies)), encoding="utf-8")
+    print(f"  {task_id} tasks / subsets, {total_frames} frames, {track_id} tracks")
+
+
+def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
+                         with_images: bool, clamp: bool = True,
+                         level: str = TASK, entries: list | None = None) -> None:
+    """Export an idah-image dataset to a CVAT 'for images 1.1' package.
+
+    An image dataset is a *single* CVAT task whatever the level — all entries
+    become ``<image>`` elements of one ``annotations.xml`` — so the three levels
+    differ only in the ``<meta>`` wrapper (and, at project level, in the
+    ``images/default/`` layout and the ``task_id=``/``subset=`` on each image).
+    ``entries`` narrows which entries are included (job level passes one).
     """
     labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
 
-    task_dir = out_dir / _safe_name(ds.name)
-    images_dir = task_dir / "images"
+    if entries is None:
+        entries = [e for e in upd.entries.for_dataset(ds.id) if e.is_local]
+
+    if level == PROJECT:
+        task_dir = out_dir / f"project_{_safe_name(ds.name)}"
+        images_dir = task_dir / "images" / "default"
+        image_attrs = f' task_id="{task_id}" subset="default"'
+    elif level == JOB:
+        task_dir = out_dir / _safe_name(ds.name) / f"job_{_entry_folder(entries[0])}"
+        images_dir = task_dir / "images"
+        image_attrs = ""
+    else:
+        task_dir = out_dir / _safe_name(ds.name)
+        images_dir = task_dir / "images"
+        image_attrs = ""
+
     blocks: list[str] = []
     seen_names: set[str] = set()
     n_shapes = 0
 
-    entries = [e for e in upd.entries.for_dataset(ds.id) if e.is_local]
     for img_id, entry in enumerate(entries):
         media = upd.medias.get(entry.local_media_id)
         if media is None or media.blob_data is None:
             print(f"  ! entry {entry.id}: media missing, skipping")
             continue
 
-        name = entry.metadata.get("Name") or entry.local_media_id
+        name = _entry_name(entry)
         if name in seen_names:                       # keep image names unique
             name = f"{Path(name).stem}_{Path(entry.local_media_id).stem}{Path(name).suffix}"
         seen_names.add(name)
@@ -626,25 +986,31 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: b
         annotations = upd.annotations.for_entry(entry.id)
         body = write_image_body(annotations, width, height, clamp=clamp)
         n_shapes += body.count("<")
-        blocks.append(
-            f'  <image id="{img_id}" name="{escape(name)}" '
-            f'width="{width}" height="{height}">\n{body}\n  </image>'
-            if body else
-            f'  <image id="{img_id}" name="{escape(name)}" width="{width}" height="{height}"></image>'
-        )
+        open_tag = (f'  <image id="{img_id}" name="{escape(name)}" '
+                    f'width="{width}" height="{height}"{image_attrs}>')
+        blocks.append(f'{open_tag}\n{body}\n  </image>' if body
+                      else f'{open_tag}</image>')
 
         if with_images:
             images_dir.mkdir(parents=True, exist_ok=True)
             (images_dir / name).write_bytes(media.blob_data)
 
-    meta = build_meta_images(task_id=task_id, name=ds.name, size=len(blocks),
-                             labels_xml=labels_xml)
-    xml = (f'<?xml version="1.0" encoding="utf-8"?>\n'
-           f'<annotations>\n  <version>1.1</version>\n'
-           f'{meta}\n' + "\n".join(blocks) + "\n</annotations>\n")
+    if level == PROJECT:
+        meta = build_meta_project(
+            project_id=task_id, name=ds.name, labels_xml=labels_xml,
+            task_blocks=[_task_block(task_id=task_id, name=ds.name,
+                                     size=len(blocks), mode="annotation")],
+        )
+    elif level == JOB:
+        meta = build_meta_job(job_id=task_id, size=len(blocks),
+                              labels_xml=labels_xml, mode="annotation")
+    else:
+        meta = build_meta_images(task_id=task_id, name=ds.name,
+                                 size=len(blocks), labels_xml=labels_xml)
 
     task_dir.mkdir(parents=True, exist_ok=True)
-    (task_dir / "annotations.xml").write_text(xml, encoding="utf-8")
+    (task_dir / "annotations.xml").write_text(
+        _document(meta, "\n".join(blocks)), encoding="utf-8")
     msg = f"  {len(blocks)} images, {n_shapes} shapes"
     if with_images:
         msg += ", images copied"
@@ -652,44 +1018,71 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int, with_images: b
 
 
 def run(upd_path: str, output: str, *, with_images: bool = False,
-        dataset_filter: str | None = None, clamp: bool = True) -> None:
-    """Export every supported dataset in ``upd_path`` to CVAT under ``output``.
+        dataset_id: str | None = None, entry_id: str | None = None,
+        clamp: bool = True) -> None:
+    """Export the datasets in ``upd_path`` to CVAT packages under ``output``.
+
+    The *level* of the export follows the filters — see :func:`level_for`. With
+    no filter every dataset is dumped as a CVAT project; ``dataset_id`` narrows
+    to one dataset and drops to task level; ``entry_id`` narrows to one entry
+    and drops to job level.
 
     ``clamp`` (default) clips every shape to the image/frame bounds so no point
     lands outside the media — IDAH normalised points can drift outside
     ``[0, 1]``. Disable it to preserve the raw out-of-bounds coordinates.
     """
     out_dir = Path(output)
+    level = level_for(dataset_id, entry_id)
 
     with UPD.open(upd_path, read_only=True) as upd:
         datasets = upd.datasets.all()
-        if dataset_filter:
-            datasets = [d for d in datasets if d.id == dataset_filter]
+        if dataset_id:
+            datasets = [d for d in datasets if d.id == dataset_id]
+            if not datasets:
+                raise SystemExit(f"no dataset with id {dataset_id!r}")
 
-        # CVAT task <id> must be an integer; IDAH ids are UUIDv7 strings. CVAT
-        # reassigns its own id on import, so a sequential counter per exported
-        # task is sufficient (the IDAH identity is preserved in the task name /
-        # folder name).
-        task_id = 0
+        # CVAT project/task/job <id>s must be integers; IDAH ids are UUIDv7
+        # strings. CVAT reassigns its own ids on import, so a sequential counter
+        # per exported unit is sufficient (the IDAH identity is preserved in the
+        # name / folder name).
+        unit_id = 0
+        exported = 0
 
         for ds in datasets:
-            print(f"Dataset {ds.name!r} (modality={ds.modality})")
+            entries = [e for e in upd.entries.for_dataset(ds.id) if e.is_local]
+            if entry_id:
+                entries = [e for e in entries if e.id == entry_id]
+                if not entries:
+                    continue
 
-            if ds.modality == "idah-image":
-                export_image_dataset(upd, ds, out_dir, task_id=task_id,
-                                     with_images=with_images, clamp=clamp)
-                task_id += 1
-                continue
-            if ds.modality != "idah-video":
+            if ds.modality not in ("idah-image", "idah-video"):
                 print(f"  ! unsupported modality {ds.modality!r}, skipping")
                 continue
 
-            for entry in upd.entries.for_dataset(ds.id):
-                if not entry.is_local:
-                    print(f"  ! entry {entry.id}: non-local media, skipping")
-                    continue
-                export_video_entry(upd, ds, entry, out_dir, task_id=task_id,
-                                    with_images=with_images, clamp=clamp)
-                task_id += 1
+            print(f"Dataset {ds.name!r} (modality={ds.modality}, level={level})")
+            exported += 1
+
+            if ds.modality == "idah-image":
+                export_image_dataset(upd, ds, out_dir, task_id=unit_id,
+                                     with_images=with_images, clamp=clamp,
+                                     level=level, entries=entries)
+                unit_id += 1
+                continue
+
+            if level == PROJECT:
+                export_video_project(upd, ds, entries, out_dir,
+                                     project_id=unit_id,
+                                     with_images=with_images, clamp=clamp)
+                unit_id += 1
+                continue
+
+            for entry in entries:
+                export_video_entry(upd, ds, entry, out_dir, task_id=unit_id,
+                                   with_images=with_images, clamp=clamp,
+                                   level=level)
+                unit_id += 1
+
+        if entry_id and not exported:
+            raise SystemExit(f"no entry with id {entry_id!r}")
 
     print(f"\nWritten: {out_dir}")
