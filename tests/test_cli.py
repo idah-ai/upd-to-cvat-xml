@@ -19,6 +19,7 @@ def test_defaults():
     assert args.clamp is True                 # clamp on by default
     assert args.dataset_id is None
     assert args.entry_id is None
+    assert args.split is None                 # unsplit unless asked
 
 
 def test_upd_is_required():
@@ -42,17 +43,29 @@ def test_output_and_id_filter_overrides():
     assert args.entry_id == "e-1"
 
 
+def test_split_takes_an_entry_count():
+    assert parse(["--upd", "x", "--split", "25"]).split == 25
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "2.5", "many"])
+def test_split_rejects_non_positive_integers(value):
+    with pytest.raises(SystemExit):
+        parse(["--upd", "x", "--split", value])
+
+
 def test_main_delegates_to_run(monkeypatch):
     calls = {}
 
-    def fake_run(upd_path, output, *, with_images, dataset_id, entry_id, clamp):
+    def fake_run(upd_path, output, *, with_images, dataset_id, entry_id, clamp,
+                 split):
         calls.update(upd_path=upd_path, output=output, with_images=with_images,
-                     dataset_id=dataset_id, entry_id=entry_id, clamp=clamp)
+                     dataset_id=dataset_id, entry_id=entry_id, clamp=clamp,
+                     split=split)
 
     monkeypatch.setattr(cli, "run", fake_run)
     cli.main(["--upd", "in.upd", "--output", "out", "--with-images",
-              "--no-clamp", "--dataset-id", "d1"])
+              "--no-clamp", "--dataset-id", "d1", "--split", "10"])
     assert calls == {
         "upd_path": "in.upd", "output": "out", "with_images": True,
-        "dataset_id": "d1", "entry_id": None, "clamp": False,
+        "dataset_id": "d1", "entry_id": None, "clamp": False, "split": 10,
     }

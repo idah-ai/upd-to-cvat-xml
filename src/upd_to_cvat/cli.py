@@ -31,14 +31,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--entry-id", dest="entry_id", default=None,
                    help="Export only this entry, at CVAT job level: one "
                         "annotations.xml with a <job> meta block.")
+    p.add_argument("--split", type=_positive_int, default=None, metavar="N",
+                   help="Split a project-level export into packages of at most "
+                        "N entries each, named project_<dataset>_partNNofMM, so "
+                        "a large dataset can be uploaded to CVAT in several "
+                        "smaller batches instead of one huge one. Ignored at "
+                        "task/job level, which already write one package per "
+                        "entry.")
     return p
+
+
+def _positive_int(text: str) -> int:
+    """``--split`` accepts entry counts only: a whole number of entries ≥ 1."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     run(args.upd, args.output,
         with_images=args.with_images, dataset_id=args.dataset_id,
-        entry_id=args.entry_id, clamp=args.clamp)
+        entry_id=args.entry_id, clamp=args.clamp, split=args.split)
 
 
 if __name__ == "__main__":

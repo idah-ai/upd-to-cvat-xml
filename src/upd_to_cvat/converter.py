@@ -30,7 +30,10 @@ see :data:`PROJECT` and :func:`level_for` for the mapping::
                                                                         images/frame_000000.PNG
 
 At project level each entry gets its own *subset*, since CVAT creates one task
-per subset on import — see :func:`export_video_project`.
+per subset on import — see :func:`export_video_project`. A project package holds
+the whole dataset and is a single upload, so ``split`` can cut it into
+``project_<dataset>_partNNofMM`` packages of at most N entries, each a complete
+CVAT project on its own — see :func:`split_entries`.
 
 For ``idah-image`` the dataset is a single task at every level, so the task- and
 job-level paths lose the per-entry folder and the images are ``<name>.jpg``.
@@ -190,6 +193,76 @@ CVAT_LABEL_TYPES = {
     "circle": "ellipse",
     "points": "points",
 }
+
+
+def label_ids(labeling_config: dict) -> set[str]:
+    """The label ids a Labeling-Configuration declares.
+
+    The same ids :func:`build_labels` turns into ``<labels>`` entries, which is
+    exactly the set CVAT will accept on a shape — see :func:`check_categories`.
+    """
+    ids: set[str] = set()
+    for shape_type in (labeling_config or {}):
+        for value in (labeling_config[shape_type] or {}).get("values", []):
+            vid = value.get("id") or value.get("label")
+            if vid:
+                ids.add(vid)
+    return ids
+
+
+def check_categories(annotations: list, declared: set[str], *,
+                     where: str = "") -> dict:
+    """Report annotation categories the dataset's taxonomy does not declare.
+
+    CVAT resolves a shape's ``label=`` by name against the ``<labels>`` block
+    and rejects the *whole import* when it does not find one::
+
+        CvatImportError: Image frame_000000: can't import annotation #3 (bbox):
+        annotation has no label
+
+    The category is written through verbatim (it has to be — it is the only
+    unique key IDAH has, see :func:`build_labels`), so a category that is not in
+    the Labeling-Configuration produces a package that looks fine and fails on
+    upload. Real data holds a handful: a ``vessel/civilian-/…`` typo, where the
+    branch name picked up a stray hyphen, appears on 6 rows of one batch.
+
+    Reported rather than corrected, and never dropped: guessing that
+    ``civilian-`` meant ``civilian`` would silently relabel someone's work, and
+    which rows are wrong is a question for the annotators. The return value maps
+    the offending category to its rows so callers can total them up.
+    """
+    if not declared:
+        return {}                    # no taxonomy to check against
+    bad: dict = {}
+    for ann in annotations:
+        category = ann.annotation.get("category", "")
+        if category not in declared:
+            bad.setdefault(category, []).append(ann)
+    for category, rows in sorted(bad.items()):
+        _warn(where, f"category {category!r} is not declared in this dataset's "
+                     f"Labeling-Configuration — CVAT will reject the import "
+                     f"({len(rows)} row(s)):")
+        for r in rows:
+            print(f"        frames {_row_span(r)}")
+    return bad
+
+
+def _report_undeclared_total(undeclared: dict) -> None:
+    """The package-level verdict on undeclared categories, or nothing.
+
+    The per-entry warnings scroll away on a big export, and this one failure
+    mode makes the *whole* package unimportable rather than degrading it, so it
+    is restated at the end where it is the last thing on screen.
+    """
+    if not undeclared:
+        return
+    n_rows = sum(len(v) for v in undeclared.values())
+    print(f"  !! {n_rows} row(s) across {len(undeclared)} undeclared "
+          f"categor{'y' if len(undeclared) == 1 else 'ies'} — CVAT will reject "
+          f"this package on import:")
+    for category, rows in sorted(undeclared.items()):
+        print(f"       {category!r} ({len(rows)} row(s))")
+    print("     fix the category on those rows in IDAH, then re-export.")
 
 
 def build_labels(labeling_config: dict) -> str:
@@ -499,6 +572,10 @@ def bbox_to_cvat(points_norm: list[list[float]], angle: float,
     gives the box and ``rotation`` is the angle. IDAH stores the angle in
     radians; CVAT's ``rotation`` attribute is in degrees.
 
+    The returned angle keeps IDAH's sign and stays unwrapped, because callers
+    interpolate it; it is wrapped into CVAT's ``[0, 360)`` only when serialised,
+    by :func:`_rotation_attr`.
+
     With ``clamp`` (default) the box is clipped to the image bounds so no corner
     lands outside ``[0, w] × [0, h]`` — IDAH normalised points can drift outside
     ``[0, 1]``. Clamping is skipped for rotated boxes, where the stored corners
@@ -572,19 +649,69 @@ def is_occluded(annotation: dict) -> bool:
     the box the annotator drew. CVAT's own exports agree — in the reference dump
     ``outside="1"`` appears only as a track's final terminator.
     """
+    return any(str(v).strip().lower() in OCCLUSION_VALUES
+               for v in _occlusion_values(annotation))
+
+
+def _occlusion_values(annotation: dict) -> list:
+    """The raw ``occlusion`` entries of an annotation, always as a list."""
     attributes = (annotation or {}).get("attributes") or {}
     value = attributes.get("occlusion", "") if isinstance(attributes, dict) else ""
-    values = value if isinstance(value, list) else [value]
-    return any(str(v).strip().lower() in OCCLUSION_VALUES for v in values)
+    return value if isinstance(value, list) else [value]
+
+
+def _check_occlusion(ann, *, where: str = "") -> None:
+    """Report an ``occlusion`` value :func:`is_occluded` does not recognise.
+
+    Anything outside :data:`OCCLUSION_VALUES` silently reads as *not occluded*,
+    so a new degree added upstream, or a typo, would quietly export every shape
+    of that track as ``occluded="0"``. Blank values are not reported: they are
+    the normal "no occlusion recorded" case, and the data holds whitespace-only
+    ones (``" "``) that mean the same thing.
+    """
+    unknown = sorted({str(v).strip() for v in _occlusion_values(ann.annotation)
+                      if str(v).strip()
+                      and str(v).strip().lower() not in OCCLUSION_VALUES})
+    if unknown:
+        _warn(where, f"annotation {_row_id(ann)} has unrecognised occlusion "
+                     f"{', '.join(repr(u) for u in unknown)} — treated as not "
+                     f"occluded (known: {', '.join(sorted(OCCLUSION_VALUES))})")
 
 
 COORD_DP = 2   # decimal places the CVAT XML carries for box coordinates
 
 
+def _rotation_attr(rot: float) -> str:
+    """The ``rotation="…"`` attribute for ``rot`` degrees, or "" when upright.
+
+    CVAT's shape serializer declares ``rotation`` as
+    ``FloatField(default=0, min_value=0, max_value=360)``, so a negative angle is
+    rejected on import with *"Ensure this value is greater than or equal to 0."*
+    IDAH angles are signed (a box tilted anticlockwise is negative), so the
+    degrees are wrapped into ``[0, 360)`` here — ``-2.01`` becomes ``357.99``,
+    the same angle CVAT itself would store.
+
+    The wrap belongs *here*, at serialisation, and deliberately not in
+    :func:`bbox_to_cvat`: :func:`_bbox_track_shapes` linearly interpolates the
+    rotation component between anchors, and wrapping before that would make a
+    track crossing 0° (``-2°`` → ``+2°``, i.e. ``358`` → ``2``) sweep the long
+    way round through 180°. Interpolating unwrapped and wrapping each emitted
+    value is what CVAT does too — its ``simple_interpolation`` steps by
+    ``find_angle_diff`` (the shortest signed path) and takes ``% 360`` at the
+    end — so it re-derives our in-betweens unchanged.
+
+    Rounding precedes the wrap so an angle a hair below zero (``-0.001``) lands
+    on ``0.00`` rather than ``360.00``. Zero is emitted as no attribute at all,
+    matching CVAT's own exports for upright shapes.
+    """
+    rot = round(rot, COORD_DP) % 360
+    return f' rotation="{rot:.2f}"' if rot else ""
+
+
 def _box_xml(frame: int, box: tuple, *, keyframe: int, outside: int,
              occluded: int = 0) -> str:
     xtl, ytl, xbr, ybr, rot = box
-    rot_attr = f' rotation="{rot:.2f}"' if rot else ""
+    rot_attr = _rotation_attr(rot)
     return (f'    <box frame="{frame}" keyframe="{keyframe}" outside="{outside}" '
             f'occluded="{occluded}" xtl="{xtl:.2f}" ytl="{ytl:.2f}" '
             f'xbr="{xbr:.2f}" ybr="{ybr:.2f}"{rot_attr} z_order="0">\n    </box>')
@@ -629,16 +756,120 @@ def _bbox_track_shapes(seq: list, w: int, h: int, *, clamp: bool) -> list:
     return out
 
 
-def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
-                     clamp: bool = True, track_id_start: int = 0,
-                     extra_attrs: str = "") -> str:
-    """Build the <track> body for one video from its annotations.
+def _warn(where: str, text: str) -> None:
+    """A row-level warning, prefixed with the entry it came from.
 
-    Every frame in each track's ``[start, end]`` is materialised using the
-    interpolation helper (bbox = linear, polygon = flubber), rather than
-    emitting only keyframes and relying on CVAT's own interpolation.
+    ``where`` is the entry name the caller was given; it is dropped when empty
+    so the low-level helpers stay usable (and testable) without one.
+    """
+    origin = f"{where}: " if where else ""
+    print(f"    ! {origin}{text}")
 
-    The ``keyframe=`` flag then differs per shape type, because CVAT stores only
+
+def _row_id(ann) -> str:
+    return str(getattr(ann, "id", None) or "?")
+
+
+def _row_span(ann) -> str:
+    """``12..48 [019f26…]`` — a row's frame span and id, for warnings.
+
+    The id is what identifies the row back in IDAH, so every warning about a
+    dropped or surprising row carries one.
+    """
+    sa = getattr(ann, "shape_args", None) or {}
+    return f"{sa.get('start', '?')}..{sa.get('end', '?')} [{_row_id(ann)}]"
+
+
+def _report_mixed_categories(by_gid: dict, *, where: str = "") -> None:
+    """Report groups whose rows disagree about the category.
+
+    Such a group becomes one track *per category* (see
+    :func:`_group_annotations`), which is intended — the categories really are
+    different objects as far as CVAT is concerned — but it is the single most
+    confusing thing in the output, since one IDAH object turns into two tracks
+    that look like duplicates stacked on the same frames. The rows are listed
+    with their spans and ids so the split can be checked against IDAH directly.
+    """
+    for gid, cats in by_gid.items():
+        # Only categories that still have a row with frames become a track — a
+        # category represented solely by an empty row is dropped downstream, so
+        # counting it here would promise a track that never gets emitted.
+        live = {cat: rows for cat, rows in cats.items()
+                if any((getattr(r, "shape_args", None) or {}).get("frames")
+                       for r in rows)}
+        if len(live) < 2:
+            continue
+        _warn(where, f"group [{gid}] carries {len(live)} categories, so it "
+                     f"splits into {len(live)} tracks:")
+        for cat, rows in live.items():
+            spans = ", ".join(_row_span(r) for r in rows)
+            print(f"        {cat!r}: frames {spans}")
+
+
+def _group_annotations(annotations: list, *, where: str = "") -> list[list]:
+    """Regroup annotation rows into the tracks they belong to.
+
+    IDAH splits one object's timeline across several annotation rows tied
+    together by ``Group-Id``: abutting spans while the object stays visible
+    (``9..13 | 14..28 | 29..33``), and a hole between spans when it leaves frame
+    and comes back (``5..9 | 23..25``). Those rows are a *single* CVAT track — a
+    track is the identity of one object over time — so they are reassembled here
+    and the holes become ``outside="1"`` gaps.
+
+    The grouping is **leader/follower**, not a shared token: the first row of an
+    object carries *no* ``Group-Id`` at all, and every later row carries the
+    leader's own annotation ``id`` as its ``Group-Id``. So a row's group is
+    ``Group-Id`` when it has one and its own ``id`` when it does not — keying on
+    the presence of ``Group-Id`` alone would leave every leader stranded in a
+    track of its own, splitting each such object in two (23 of the 150 tracks in
+    one real dataset). A ``Group-Id`` naming a row that is not in the entry (a
+    deleted leader) still keys a group of its own, so the rows naming it merge
+    with each other and only the leader's own frames are lost — which is all we
+    can do, since that row is gone from the data entirely.
+
+    A group is split by **category**, though: an IDAH group can carry rows of
+    more than one category (an object annotated as two different things over its
+    life), and a CVAT track holds exactly one label, so each category in a group
+    becomes its own track. Same category + same group merge; different
+    categories under the one group come out as separate tracks.
+
+    Tracks are returned in order of first appearance so track ids stay stable,
+    and each track's rows are ordered by start frame.
+
+    A category split *is* reported against ``where``, since it turns one IDAH
+    object into two tracks and nothing in the output XML says so. A dangling
+    ``Group-Id`` is not: the rows naming a missing leader still group with each
+    other, so the track that comes out is the same one they would have formed
+    anyway and the XML is valid either way — there is nothing for the reader of
+    the log to act on.
+    """
+    groups: dict = {}
+    order: list = []
+    by_gid: dict = {}
+    for i, ann in enumerate(annotations):
+        gid = ((getattr(ann, "metadata", None) or {}).get("Group-Id")
+               or getattr(ann, "id", None))
+        category = ann.annotation.get("category", "")
+        # A group is keyed by (group, category) so mixed-category groups split;
+        # a row with neither a Group-Id nor an id can only stand alone.
+        key = ("group", gid, category) if gid else ("row", i)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(ann)
+        if gid:
+            by_gid.setdefault(gid, {}).setdefault(category, []).append(ann)
+
+    _report_mixed_categories(by_gid, where=where)
+    return [sorted(groups[k], key=lambda a: a.shape_args.get("start", 0))
+            for k in order]
+
+
+def _segment_shapes(suffix: str, seq: list, w: int, h: int, *, clamp: bool,
+                    occluded: int) -> tuple[list[str], tuple]:
+    """The shapes for one contiguous segment, plus its final geometry.
+
+    The ``keyframe=`` flag differs per shape type, because CVAT stores only
     keyframe shapes — on import it discards ``keyframe="0"`` frames and
     re-interpolates linearly between the real keyframes:
 
@@ -650,73 +881,149 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
       boxes linearly, so CVAT rebuilds byte-identical geometry from the
       keyframes alone, and the track stays cheap to edit in the UI.
 
-    The first emitted shape of a track is always a keyframe regardless: a
-    leading ``keyframe="0"`` would be discarded and the track would start late.
+    A segment's first shape is always a keyframe regardless — a leading
+    ``keyframe="0"`` would be discarded and the segment would start late, which
+    matters twice over here, since a segment may be resuming after a gap.
+    """
+    if suffix == interp.BBOX:
+        emitted = _bbox_track_shapes(seq, w, h, clamp=clamp)
+        shapes = [_box_xml(frame, box, keyframe=keyframe, outside=0,
+                           occluded=occluded)
+                  for (frame, *_), (keyframe, box) in zip(seq, emitted)]
+        return shapes, emitted[-1][1]
 
-    Bbox in-betweens are computed from the *emitted, rounded* keyframes rather
-    than from full-precision source geometry, so importing and re-exporting the
-    file through CVAT returns it unchanged — see :func:`_bbox_track_shapes`.
+    shapes = [_frame_shape(suffix, frame, points, w, h, keyframe=1, outside=0,
+                           angle=angle, clamp=clamp, occluded=occluded)
+              for frame, points, angle, _is_kf in seq]
+    return shapes, (seq[-1][1], seq[-1][2])
 
-    The track ``label=`` is the annotation ``category`` (the IDAH tree-path
-    *id*, e.g. ``"vehicles/truck"``), used verbatim so it matches the ``id``-
-    keyed ``<labels>`` block — CVAT rejects tracks whose label is not declared.
+
+def _outside_shape(suffix: str, frame: int, tail: tuple, w: int, h: int, *,
+                   clamp: bool, occluded: int) -> str:
+    """An ``outside="1"`` shape marking the object as gone from ``frame`` on.
+
+    CVAT shapes persist forward until the next one overrides them, so a track
+    needs an explicit "not here" marker or its last box stays painted on every
+    remaining frame. The geometry repeats the previous shape's — CVAT wants
+    coordinates but never draws them — and it is a keyframe so import keeps it.
+    """
+    if suffix == interp.BBOX:
+        return _box_xml(frame, tail, keyframe=1, outside=1, occluded=occluded)
+    return _frame_shape(suffix, frame, tail[0], w, h, keyframe=1, outside=1,
+                        angle=tail[1], clamp=clamp, occluded=occluded)
+
+
+def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
+                     clamp: bool = True, track_id_start: int = 0,
+                     extra_attrs: str = "", where: str = "") -> str:
+    """Build the <track> body for one video from its annotations.
+
+    Annotation rows are first reassembled into tracks by ``Group-Id`` *and*
+    category (see :func:`_group_annotations`), so one object that IDAH stored as
+    several same-category rows becomes one track with one identity, while a group
+    that mixes categories splits into one track per category. Where consecutive
+    rows of a track leave a hole in time, the object was out of frame and an
+    ``outside="1"`` shape closes the track over the hole; the next row reopens it.
+
+    Every frame in each segment's ``[start, end]`` is materialised using the
+    interpolation helper (bbox = linear, polygon = flubber) rather than emitting
+    only keyframes and relying on CVAT's own interpolation — see
+    :func:`_segment_shapes` for the ``keyframe=`` rules, and
+    :func:`_bbox_track_shapes` for why bbox in-betweens are derived from the
+    emitted, rounded keyframes.
+
+    The track ``label=`` is the ``category`` shared by its rows (the IDAH
+    tree-path *id*, e.g. ``"vehicles/truck"``), used verbatim so it matches the
+    ``id``-keyed ``<labels>`` block — CVAT rejects tracks whose label is not
+    declared. Occlusion, by contrast, is per *segment*, since each row carries
+    its own.
 
     ``track_id_start`` and ``extra_attrs`` exist for the project level, where
     track ids must stay unique across every task in the project and each track
     carries the ``task_id=``/``subset=`` naming the task it belongs to.
+
+    Every row that is dropped, and every group that splits, is reported —
+    nothing disappears from the export silently, since none of it is visible in
+    the resulting XML. Each warning names the annotation id so the row can be
+    found back in IDAH. ``where`` prefixes those warnings with the entry being
+    converted; the exporters leave it empty because they print an entry header
+    first and let the warnings nest under it, but a direct caller converting
+    several entries in a loop will want it.
+
+    A span reaching outside the video's ``0 … n_frames-1`` is reported but
+    emitted unchanged — one real dataset holds a polygon with ``start=-1``,
+    which CVAT will reject since its frames are non-negative. That is malformed
+    at the source, so it is surfaced rather than papered over here.
     """
     blocks: list[str] = []
     track_id = track_id_start
 
-    for ann in annotations:
-        suffix = _shape_suffix(ann.shape_type)
-        if suffix not in (interp.BBOX, interp.POLYGON):
-            print(f"    ! skipping unsupported shape_type {ann.shape_type!r}")
-            continue
-
-        sa = ann.shape_args
-        frames = sa.get("frames", [])
-        if not frames:
-            continue
-        label = ann.annotation.get("category", "")
-        end = sa.get("end", frames[-1]["frame"])
-        # IDAH occlusion is a property of the annotation, so it holds for every
-        # frame of the track — including the terminator (see is_occluded).
-        occluded = int(is_occluded(ann.annotation))
-
-        seq = list(interp.iter_frames(sa, kind=suffix))
-        if not seq:
-            continue
-
+    for group in _group_annotations(annotations, where=where):
         shapes: list[str] = []
-        if suffix == interp.BBOX:
-            # Only the real keyframes are keyframe="1"; the in-betweens are
-            # derived from those emitted anchors so CVAT rebuilds them exactly.
-            emitted = _bbox_track_shapes(seq, w, h, clamp=clamp)
-            for (frame, *_), (keyframe, box) in zip(seq, emitted):
-                shapes.append(_box_xml(frame, box, keyframe=keyframe,
-                                       outside=0, occluded=occluded))
-            tail = emitted[-1][1]
-        else:
-            # Polygons keep every frame a keyframe: CVAT's polygon interpolation
-            # is not flubber, so anything it re-derived would not match.
-            for frame, points, angle, _is_kf in seq:
-                shapes.append(_frame_shape(suffix, frame, points, w, h,
-                                           keyframe=1, outside=0, angle=angle,
-                                           clamp=clamp, occluded=occluded))
-            tail = (seq[-1][1], seq[-1][2])
+        suffix = label = None
+        prev_end = prev_tail = prev_occluded = None
 
-        # Terminate the track with an outside="1" shape one frame past the end,
-        # unless the track already runs to the last video frame. CVAT marks the
-        # terminating outside shape as a keyframe (keyframe="1").
-        if end + 1 <= n_frames - 1:
-            if suffix == interp.BBOX:
-                shapes.append(_box_xml(end + 1, tail, keyframe=1, outside=1,
-                                       occluded=occluded))
-            else:
-                shapes.append(_frame_shape(suffix, end + 1, tail[0], w, h,
-                                           keyframe=1, outside=1, angle=tail[1],
-                                           clamp=clamp, occluded=occluded))
+        for ann in group:
+            current = _shape_suffix(ann.shape_type)
+            if current not in (interp.BBOX, interp.POLYGON):
+                _warn(where, f"annotation {_row_id(ann)}: unsupported "
+                             f"shape_type {ann.shape_type!r} — skipped")
+                continue
+
+            sa = ann.shape_args
+            frames = sa.get("frames", [])
+            if not frames:
+                _warn(where, f"no frames on annotation {_row_span(ann)} — "
+                             f"nothing to emit, skipped")
+                continue
+
+            if suffix is None:
+                suffix, label = current, ann.annotation.get("category", "")
+            elif current != suffix:
+                # One track is one shape type; a mixed group cannot be expressed.
+                _warn(where, f"annotation {_row_id(ann)}: {ann.shape_type!r} in "
+                             f"a group already emitting {suffix!r} — skipped, "
+                             f"one track is one shape type")
+                continue
+
+            seq = list(interp.iter_frames(sa, kind=suffix))
+            if not seq:
+                _warn(where, f"annotation {_row_span(ann)} has {len(frames)} "
+                             f"keyframe(s) but interpolated to no frames — "
+                             f"skipped")
+                continue
+
+            _check_occlusion(ann, where=where)
+            occluded = int(is_occluded(ann.annotation))
+            start = sa.get("start", frames[0]["frame"])
+            end = sa.get("end", frames[-1]["frame"])
+
+            if n_frames > 0 and (start < 0 or end > n_frames - 1):
+                _warn(where, f"annotation {_row_id(ann)} spans frames "
+                             f"{start}..{end}, outside the video's "
+                             f"0..{n_frames - 1} — emitted unchanged, CVAT may "
+                             f"reject it")
+
+            # A hole before this segment means the object was out of frame:
+            # close the track over it, and this segment reopens it.
+            if prev_end is not None and start > prev_end + 1:
+                shapes.append(_outside_shape(suffix, prev_end + 1, prev_tail,
+                                             w, h, clamp=clamp,
+                                             occluded=prev_occluded))
+
+            segment, tail = _segment_shapes(suffix, seq, w, h, clamp=clamp,
+                                            occluded=occluded)
+            shapes += segment
+            prev_end, prev_tail, prev_occluded = end, tail, occluded
+
+        if not shapes:
+            continue
+
+        # Terminate the track one frame past its end, unless it already runs to
+        # the last video frame — there would be no frame to put the marker on.
+        if prev_end + 1 <= n_frames - 1:
+            shapes.append(_outside_shape(suffix, prev_end + 1, prev_tail, w, h,
+                                         clamp=clamp, occluded=prev_occluded))
 
         blocks.append(
             f'  <track id="{track_id}" label={quoteattr(label)} '
@@ -737,7 +1044,7 @@ def _frame_shape(suffix: str, frame: int, points: list, w: int, h: int, *,
 
     if suffix == interp.BBOX:
         xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, angle, w, h, clamp=clamp)
-        rot_attr = f' rotation="{rot:.2f}"' if rot else ""
+        rot_attr = _rotation_attr(rot)
         return (f'    <box {common} '
                 f'xtl="{xtl:.2f}" ytl="{ytl:.2f}" xbr="{xbr:.2f}" ybr="{ybr:.2f}"'
                 f'{rot_attr} z_order="0">\n    </box>')
@@ -773,14 +1080,15 @@ def build_meta_images(*, task_id: int, name: str, size: int, labels_xml: str) ->
 
 
 def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str, *,
-                 clamp: bool = True, occluded: int = 0) -> str | None:
+                 clamp: bool = True, occluded: int = 0, where: str = "",
+                 ann_id: str = "?") -> str | None:
     """One CVAT image-format shape element, or None for unsupported types."""
     common = f'label={quoteattr(label)} source="manual" occluded="{occluded}"'
     points = shape_args.get("points", [])
 
     if suffix == "bounding-box":
         xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, shape_args.get("angle", 0), w, h, clamp=clamp)
-        rot_attr = f' rotation="{rot:.2f}"' if rot else ""
+        rot_attr = _rotation_attr(rot)
         return (f'    <box {common} '
                 f'xtl="{xtl:.2f}" ytl="{ytl:.2f}" xbr="{xbr:.2f}" ybr="{ybr:.2f}"'
                 f'{rot_attr} z_order="0"></box>')
@@ -795,29 +1103,35 @@ def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str, *,
         # points = [[cx, cy], [rx, ry]] (normalised); circle has rx == ry.
         (cx, cy), (rx, ry) = points[0], points[1]
         rot = math.degrees(shape_args.get("angle", 0) or 0.0)
-        rot_attr = f' rotation="{rot:.2f}"' if rot else ""
+        rot_attr = _rotation_attr(rot)
         return (f'    <ellipse {common} '
                 f'cx="{cx * w:.2f}" cy="{cy * h:.2f}" rx="{rx * w:.2f}" ry="{ry * h:.2f}"'
                 f'{rot_attr} z_order="0"></ellipse>')
 
-    print(f"    ! skipping unsupported shape_type suffix {suffix!r}")
+    _warn(where, f"annotation {ann_id}: unsupported shape_type suffix "
+                 f"{suffix!r} — skipped")
     return None
 
 
-def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True) -> str:
+def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True,
+                     where: str = "") -> str:
     """Shape elements for one image (CVAT image format).
 
     The shape ``label=`` is the annotation ``category`` (the IDAH tree-path
     *id*) verbatim, matching the ``id``-keyed ``<labels>`` block, and
     ``occluded=`` comes from the IDAH occlusion attribute (see
     :func:`is_occluded`).
+
+    ``where`` only labels the warnings, naming the image being converted.
     """
     out: list[str] = []
     for ann in annotations:
         suffix = _shape_suffix(ann.shape_type)
         label = ann.annotation.get("category", "")
+        _check_occlusion(ann, where=where)
         el = _image_shape(suffix, ann.shape_args, w, h, label, clamp=clamp,
-                          occluded=int(is_occluded(ann.annotation)))
+                          occluded=int(is_occluded(ann.annotation)),
+                          where=where, ann_id=_row_id(ann))
         if el is not None:
             out.append(el)
     return "\n".join(out)
@@ -882,6 +1196,35 @@ def _entry_media(upd, entry):
         yield tmp.name
 
 
+def split_entries(entries: list, size: int | None) -> list[list]:
+    """Chunk ``entries`` into consecutive groups of at most ``size``.
+
+    A whole dataset exported as one project-level package is a single upload —
+    a real one runs to ~13 GB with ``--with-images``, which is impractical to
+    push to CVAT in one go. Splitting cuts the entry list into parts that are
+    each a self-contained CVAT project package.
+
+    ``size`` of ``None`` (or anything below 1) means "do not split" and yields
+    the one group, so callers can pass the flag through unconditionally.
+    """
+    if not size or size < 1:
+        return [list(entries)]
+    return [list(entries[i:i + size]) for i in range(0, len(entries), size)]
+
+
+def _part_suffix(part: tuple[int, int] | None) -> str:
+    """``_part03of12`` for part 3 of 12, or ``""`` when unsplit.
+
+    The index is zero-padded to the width of the total so the parts sort in
+    order, and the total is carried in the name so a folder (or the CVAT
+    project it becomes on import) says on its own how many siblings it has.
+    """
+    if part is None:
+        return ""
+    index, total = part
+    return f"_part{index:0{len(str(total))}d}of{total}"
+
+
 def _entry_name(entry) -> str:
     return entry.metadata.get("Name") or entry.local_media_id
 
@@ -922,8 +1265,14 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
                               labels_xml=labels_xml, width=width, height=height,
                               source=name)
 
-        body = write_video_body(upd.annotations.for_entry(entry.id),
-                                width, height, n_frames, clamp=clamp)
+        # The header goes first so the conversion's own warnings nest under the
+        # entry they belong to — that attribution is what `where` is for, and
+        # repeating the entry name on every warning line drowns them out.
+        rows = list(upd.annotations.for_entry(entry.id))
+        print(f"  [{name}] {width}x{height}, {n_frames} frames, {len(rows)} rows")
+        undeclared = check_categories(
+            rows, label_ids(ds.metadata.get("Labeling-Configuration", {})))
+        body = write_video_body(rows, width, height, n_frames, clamp=clamp)
 
         folder = _entry_folder(entry)
         if level == JOB:
@@ -934,7 +1283,11 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
                                                   encoding="utf-8")
 
         n_tracks = body.count("<track ")
-        print(f"  [{name}] {width}x{height}, {n_frames} frames, {n_tracks} tracks")
+        print(f"    → {n_tracks} tracks")
+        if rows and not n_tracks:
+            print(f"    ! {len(rows)} annotation rows produced no tracks — "
+                  f"this entry exports empty")
+        _report_undeclared_total(undeclared)
 
         if with_images:
             extract_frames(media_path, task_dir / "images", total=n_frames)
@@ -942,7 +1295,8 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
 
 def export_video_project(upd, ds, entries: list, out_dir: Path, *,
                          project_id: int, with_images: bool,
-                         clamp: bool = True) -> None:
+                         clamp: bool = True,
+                         part: tuple[int, int] | None = None) -> None:
     """Export a whole idah-video dataset as one project-level CVAT package.
 
     Every entry becomes a ``<task>`` inside ``<meta><project><tasks>`` *and* its
@@ -957,13 +1311,22 @@ def export_video_project(upd, ds, entries: list, out_dir: Path, *,
     that starts at frame 0) and each task's frames live in their own
     ``images/<subset>/`` folder. Track ids stay unique across the whole project,
     which also makes them unique within every task.
+
+    ``part`` is the ``(index, total)`` of this slice of the dataset's entries
+    when the export is split (see :func:`split_entries`); it only names the
+    package — ``project_<dataset>_part03of12`` — since each part is a complete,
+    independent CVAT project whose task ids, subsets and track ids are numbered
+    within itself.
     """
     labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
-    project_dir = out_dir / f"project_{_safe_name(ds.name)}"
+    declared = label_ids(ds.metadata.get("Labeling-Configuration", {}))
+    part_suffix = _part_suffix(part)
+    project_dir = out_dir / f"project_{_safe_name(ds.name)}{part_suffix}"
 
     task_blocks: list[str] = []
     bodies: list[str] = []
     subsets: list[str] = []
+    undeclared: dict = {}
     task_id = track_id = total_frames = 0
 
     for entry in entries:
@@ -985,8 +1348,14 @@ def export_video_project(upd, ds, entries: list, out_dir: Path, *,
                 task_id=task_id, name=name, size=n_frames, mode="interpolation",
                 subset=subset, width=width, height=height,
             ))
+            # Header first, so the conversion's warnings nest under their entry.
+            rows = list(upd.annotations.for_entry(entry.id))
+            print(f"  [{name}] {width}x{height}, {n_frames} frames, "
+                  f"{len(rows)} rows")
+            for category, bad in check_categories(rows, declared).items():
+                undeclared.setdefault(category, []).extend(bad)
             body = write_video_body(
-                upd.annotations.for_entry(entry.id), width, height, n_frames,
+                rows, width, height, n_frames,
                 clamp=clamp, track_id_start=track_id,
                 extra_attrs=f' task_id="{task_id}" subset={quoteattr(subset)}',
             )
@@ -994,8 +1363,11 @@ def export_video_project(upd, ds, entries: list, out_dir: Path, *,
             if body:
                 bodies.append(body)
 
-            print(f"  [{name}] {width}x{height}, {n_frames} frames, "
-                  f"{n_tracks} tracks  → subset {subset!r}")
+            print(f"    → {n_tracks} tracks, ids {track_id}..{track_id + n_tracks - 1}"
+                  if n_tracks else "    → 0 tracks")
+            if rows and not n_tracks:
+                print(f"    ! {len(rows)} annotation rows produced no tracks — "
+                      f"this entry exports empty")
 
             if with_images:
                 extract_frames(media_path, project_dir / "images" / subset,
@@ -1005,18 +1377,21 @@ def export_video_project(upd, ds, entries: list, out_dir: Path, *,
             track_id += n_tracks
             total_frames += n_frames
 
-    meta = build_meta_project(project_id=project_id, name=ds.name,
+    meta = build_meta_project(project_id=project_id,
+                              name=f"{ds.name}{part_suffix}",
                               task_blocks=task_blocks, labels_xml=labels_xml,
                               subsets=subsets)
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "annotations.xml").write_text(
         _document(meta, "\n".join(bodies)), encoding="utf-8")
     print(f"  {task_id} tasks / subsets, {total_frames} frames, {track_id} tracks")
+    _report_undeclared_total(undeclared)
 
 
 def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
                          with_images: bool, clamp: bool = True,
-                         level: str = TASK, entries: list | None = None) -> None:
+                         level: str = TASK, entries: list | None = None,
+                         part: tuple[int, int] | None = None) -> None:
     """Export an idah-image dataset to a CVAT 'for images 1.1' package.
 
     An image dataset is a *single* CVAT task whatever the level — all entries
@@ -1024,14 +1399,20 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
     differ only in the ``<meta>`` wrapper (and, at project level, in the
     ``images/default/`` layout and the ``task_id=``/``subset=`` on each image).
     ``entries`` narrows which entries are included (job level passes one).
+
+    ``part`` is the ``(index, total)`` of this slice of ``entries`` when a
+    project-level export is split (see :func:`split_entries`), and only names
+    the package — each part is a complete CVAT project of its own, with its
+    images renumbered from 0.
     """
     labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
+    part_suffix = _part_suffix(part)
 
     if entries is None:
         entries = [e for e in upd.entries.for_dataset(ds.id) if e.is_local]
 
     if level == PROJECT:
-        task_dir = out_dir / f"project_{_safe_name(ds.name)}"
+        task_dir = out_dir / f"project_{_safe_name(ds.name)}{part_suffix}"
         images_dir = task_dir / "images" / "default"
         image_attrs = f' task_id="{task_id}" subset="default"'
     elif level == JOB:
@@ -1045,6 +1426,8 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
 
     blocks: list[str] = []
     seen_names: set[str] = set()
+    undeclared: dict = {}
+    declared = label_ids(ds.metadata.get("Labeling-Configuration", {}))
     n_shapes = 0
 
     for img_id, entry in enumerate(entries):
@@ -1064,8 +1447,16 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
             tmp.flush()
             width, height = probe_image(tmp.name)
 
-        annotations = upd.annotations.for_entry(entry.id)
-        body = write_image_body(annotations, width, height, clamp=clamp)
+        annotations = list(upd.annotations.for_entry(entry.id))
+        for category, bad in check_categories(annotations, declared,
+                                              where=name).items():
+            undeclared.setdefault(category, []).extend(bad)
+        body = write_image_body(annotations, width, height, clamp=clamp,
+                                where=name)
+        n_dropped = len(annotations) - body.count("\n") - bool(body)
+        if n_dropped:
+            print(f"  ! [{name}] {n_dropped} of {len(annotations)} annotations "
+                  f"produced no shape")
         n_shapes += body.count("<")
         open_tag = (f'  <image id="{img_id}" name="{escape(name)}" '
                     f'width="{width}" height="{height}"{image_attrs}>')
@@ -1077,9 +1468,10 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
             (images_dir / name).write_bytes(media.blob_data)
 
     if level == PROJECT:
+        project_name = f"{ds.name}{part_suffix}"
         meta = build_meta_project(
-            project_id=task_id, name=ds.name, labels_xml=labels_xml,
-            task_blocks=[_task_block(task_id=task_id, name=ds.name,
+            project_id=task_id, name=project_name, labels_xml=labels_xml,
+            task_blocks=[_task_block(task_id=task_id, name=project_name,
                                      size=len(blocks), mode="annotation")],
         )
     elif level == JOB:
@@ -1096,11 +1488,12 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
     if with_images:
         msg += ", images copied"
     print(msg)
+    _report_undeclared_total(undeclared)
 
 
 def run(upd_path: str, output: str, *, with_images: bool = False,
         dataset_id: str | None = None, entry_id: str | None = None,
-        clamp: bool = True) -> None:
+        clamp: bool = True, split: int | None = None) -> None:
     """Export the datasets in ``upd_path`` to CVAT packages under ``output``.
 
     The *level* of the export follows the filters — see :func:`level_for`. With
@@ -1111,9 +1504,20 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
     ``clamp`` (default) clips every shape to the image/frame bounds so no point
     lands outside the media — IDAH normalised points can drift outside
     ``[0, 1]``. Disable it to preserve the raw out-of-bounds coordinates.
+
+    ``split`` caps how many entries go into one project package, so a large
+    dataset comes out as several ``project_<dataset>_partNNofMM`` packages that
+    can be zipped and uploaded to CVAT one at a time instead of as a single
+    multi-gigabyte batch (see :func:`split_entries`). It only applies at project
+    level: the lower levels already write one package per entry (video) and are
+    ignored otherwise.
     """
     out_dir = Path(output)
     level = level_for(dataset_id, entry_id)
+
+    if split and level != PROJECT:
+        print(f"  ! --split is ignored at {level} level "
+              f"(it only splits project-level exports)")
 
     with UPD.open(upd_path, read_only=True) as upd:
         datasets = upd.datasets.all()
@@ -1143,18 +1547,32 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
             print(f"Dataset {ds.name!r} (modality={ds.modality}, level={level})")
             exported += 1
 
+            # Only a project package holds every entry at once, so that is the
+            # only level --split has anything to cut.
+            chunks = (split_entries(entries, split) if level == PROJECT
+                      else [entries])
+            parts = [None if len(chunks) == 1 else (i, len(chunks))
+                     for i in range(1, len(chunks) + 1)]
+
             if ds.modality == "idah-image":
-                export_image_dataset(upd, ds, out_dir, task_id=unit_id,
-                                     with_images=with_images, clamp=clamp,
-                                     level=level, entries=entries)
-                unit_id += 1
+                for chunk, part in zip(chunks, parts):
+                    if part:
+                        print(f"  part {part[0]}/{part[1]} — {len(chunk)} entries")
+                    export_image_dataset(upd, ds, out_dir, task_id=unit_id,
+                                         with_images=with_images, clamp=clamp,
+                                         level=level, entries=chunk, part=part)
+                    unit_id += 1
                 continue
 
             if level == PROJECT:
-                export_video_project(upd, ds, entries, out_dir,
-                                     project_id=unit_id,
-                                     with_images=with_images, clamp=clamp)
-                unit_id += 1
+                for chunk, part in zip(chunks, parts):
+                    if part:
+                        print(f"  part {part[0]}/{part[1]} — {len(chunk)} entries")
+                    export_video_project(upd, ds, chunk, out_dir,
+                                         project_id=unit_id,
+                                         with_images=with_images, clamp=clamp,
+                                         part=part)
+                    unit_id += 1
                 continue
 
             for entry in entries:
