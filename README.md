@@ -32,6 +32,14 @@ per shape type — `car` is `#FFEC16` as a box but `#00A6F5` as a polygon. The
 source is genuinely ambiguous there, so the rule only has to be deterministic;
 it previously fell out of dict ordering and effectively picked at random.
 
+**Remapping to a client label schema.** The flat tree-path labels above are the
+default. Passing `--label-schema` / `--label-map` instead emits a small set of
+client-defined top-level labels, with the sub-classes carried as `L2`/`L3`/`L4`
+`select` attributes (plus optional checkboxes) on every shape. See
+[`configs/README.md`](configs/README.md) for the two-file format, how to build a
+mapping for a new dataset, and the CVAT import steps that make the attributes
+come through.
+
 ### Occlusion
 
 IDAH stores occlusion on the annotation as `attributes.occlusion`, which maps
@@ -253,6 +261,7 @@ upd-to-cvat --upd idah-export.upd --output cvat-export --entry-id <entry-id>
 | `--dataset-id`    | Export only this dataset, at **task** level.                          |
 | `--entry-id`      | Export only this entry, at **job** level.                             |
 | `--split N`       | Split a **project**-level export into packages of at most `N` entries (`project_<dataset>_partNNofMM`), so a large dataset uploads as several smaller batches. Ignored at task/job level. |
+| `--label-schema` / `--label-map` | Remap IDAH tree-path labels to a client CVAT label schema with `L2`/`L3`/`L4` attributes. Given together; see [`configs/README.md`](configs/README.md). |
 
 Equivalent module form: `python -m upd_to_cvat --upd …`.
 

@@ -47,6 +47,7 @@ is only done with ``with_images`` for video.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -320,6 +321,258 @@ def build_labels(labeling_config: dict) -> str:
         ]
     lines.append("      </labels>")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical labels (client schema + IDAH-path mapping) — opt-in
+# ---------------------------------------------------------------------------
+#
+# By default a shape's label is the IDAH tree-path *id* verbatim
+# (:func:`build_labels`), which produces a flat CVAT label set with empty
+# attributes. Some clients instead want a small set of top-level labels whose
+# sub-classes are carried as ``L2``/``L3``/``L4`` ``select`` attributes (plus
+# ad-hoc checkboxes). That taxonomy is client-defined and cannot be derived from
+# the paths — the same IDAH branch can regroup under a different label, and value
+# spellings differ (``heavytrailer`` → ``heavyTrailer``) — so it is supplied as
+# two JSON files (see ``configs/``): a *schema* (the CVAT label set, authoritative
+# for the ``<labels>`` block) and a *map* from every IDAH category to its target
+# ``{label, L2, L3, L4}``. :class:`LabelMapper` ties them together; passing one to
+# the exporters switches on the hierarchical output. Without a mapper nothing
+# changes, so existing exports stay byte-for-byte identical.
+
+
+def build_labels_from_schema(schema: list,
+                             fallback_colors: dict | None = None) -> str:
+    """The CVAT ``<labels>`` block for a client label *schema*.
+
+    Each schema entry is emitted verbatim — name, colour, type and a populated
+    ``<attributes>`` block — matching the format CVAT's own dumps use (see
+    :func:`_attributes_block`). This replaces :func:`build_labels` when a
+    :class:`LabelMapper` is in play; the label set is the client's, not the
+    dataset's Labeling-Configuration.
+
+    A label's colour is the schema's when it defines one; otherwise it falls back
+    to ``fallback_colors[name]`` — the colour inherited from the IDAH source
+    labels that map into it (see :meth:`LabelMapper.labels_xml`) — and finally to
+    empty, which lets CVAT assign one on import.
+    """
+    fallback_colors = fallback_colors or {}
+    lines = ["      <labels>"]
+    for lab in schema:
+        color = lab.get("color") or fallback_colors.get(lab["name"], "")
+        lines += [
+            "        <label>",
+            f"          <name>{escape(lab['name'])}</name>",
+            f"          <color>{escape(color)}</color>",
+            f"          <type>{escape(lab.get('type', 'any'))}</type>",
+            _attributes_block(lab.get("attributes", [])),
+            "        </label>",
+        ]
+    lines.append("      </labels>")
+    return "\n".join(lines)
+
+
+def _category_colors(labeling_config: dict) -> dict:
+    """Each IDAH category id → its source colour, or ``""``.
+
+    Mirrors :func:`build_labels`' colour rule: a category declared under several
+    shape types (with possibly different colours) takes the first, in sorted
+    shape-type order, that supplies a non-empty colour — deterministic where the
+    source is genuinely ambiguous.
+    """
+    colors: dict[str, dict[str, str]] = {}
+    for shape_type in sorted(labeling_config or {}):
+        suffix = _shape_suffix(shape_type)
+        for value in (labeling_config[shape_type] or {}).get("values", []):
+            vid = value.get("id") or value.get("label")
+            if not vid:
+                continue
+            colors.setdefault(vid, {})[suffix] = value.get("color", "")
+    return {vid: next((palette[s] for s in sorted(palette) if palette[s]), "")
+            for vid, palette in colors.items()}
+
+
+def _attributes_block(attributes: list) -> str:
+    """The ``<attributes>`` block for one label, as CVAT serialises it.
+
+    Empty collapses to ``<attributes></attributes>`` on one line, exactly like
+    :func:`build_labels`. ``select`` values are newline-separated inside a single
+    ``<values>`` element (real newlines, which is what CVAT writes and reads),
+    and ``mutable`` is the capitalised Python bool CVAT uses (``False``/``True``).
+    """
+    if not attributes:
+        return "          <attributes></attributes>"
+    out = ["          <attributes>"]
+    for a in attributes:
+        values = "\n".join(str(v) for v in a.get("values", []))
+        out += [
+            "            <attribute>",
+            f"              <name>{escape(a['name'])}</name>",
+            f"              <mutable>{'True' if a.get('mutable') else 'False'}</mutable>",
+            f"              <input_type>{escape(a.get('input_type', 'text'))}</input_type>",
+            f"              <default_value>{escape(str(a.get('default_value', '')))}</default_value>",
+            f"              <values>{escape(values)}</values>",
+            "            </attribute>",
+        ]
+    out.append("          </attributes>")
+    return "\n".join(out)
+
+
+def _shape_attrs_xml(attrs: dict) -> str:
+    """``<attribute name=…>value</attribute>`` children for one shape, or ''.
+
+    Emitted inside every ``<box>``/``<polygon>``/… of a track (all these
+    attributes are ``mutable:false``, so the value repeats on each shape). The
+    empty case returns ``""`` so shapes without a mapper serialise unchanged.
+    """
+    if not attrs:
+        return ""
+    return "".join(
+        f'\n      <attribute name={quoteattr(name)}>{escape(str(value))}</attribute>'
+        for name, value in attrs.items()
+    )
+
+
+#: IDAH checkbox truthy/falsy spellings → CVAT's ``"true"``/``"false"``.
+_CHECKBOX_TRUE = frozenset({"true", "1", "yes", "on"})
+_CHECKBOX_FALSE = frozenset({"false", "0", "no", "off", ""})
+
+
+def _checkbox_value(raw, default: str) -> str:
+    """Normalise an IDAH checkbox source value to ``"true"``/``"false"``.
+
+    IDAH stores these ad-hoc (bool, string, or a one-element list like the
+    occlusion attribute), and in practice the field is usually absent — a missing
+    value falls back to the schema ``default``. An unrecognised value also falls
+    back rather than guessing, so a new spelling upstream never silently reads as
+    ``true``.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, bool):
+        return "true" if raw else "false"
+    text = str(raw).strip().lower()
+    if text in _CHECKBOX_TRUE:
+        return "true"
+    if text in _CHECKBOX_FALSE:
+        return "false"
+    return default
+
+
+class LabelMapper:
+    """Rewrites an IDAH category to a client CVAT label + attribute values.
+
+    Built from a *schema* (the client's ``<labels>`` set) and a *map*
+    (IDAH category → ``{label, L2, L3, L4}``); see :func:`load_label_mapper` and
+    the module note above. :meth:`resolve` turns one annotation into its
+    ``(label, {attr: value})`` pair — the ``L2``/``L3``/``L4`` values from the
+    map, plus any checkbox attributes read from the IDAH annotation (falling back
+    to the schema default). Attributes come out in schema order.
+
+    A category the map does not cover resolves to itself with no attributes: it
+    is left for :func:`check_categories` to report and CVAT to reject on import,
+    never dropped — the same contract as the verbatim path.
+    """
+
+    def __init__(self, schema: list, mapping: dict):
+        self.schema = schema
+        self.mapping = mapping
+        self._by_name = {lab["name"]: lab for lab in schema}
+
+    @property
+    def declared(self) -> set:
+        """The IDAH categories the map covers — the set CVAT will accept."""
+        return set(self.mapping)
+
+    def labels_xml(self, labeling_config: dict | None = None) -> str:
+        """The ``<labels>`` block, colours inheriting from IDAH when needed.
+
+        A schema label without its own ``color`` inherits one from the IDAH
+        source labels that map into it: the colour of the first mapped category
+        (in sorted order) that has one. ``labeling_config`` is the dataset's
+        Labeling-Configuration, the source of those colours; omit it to keep the
+        schema's colours as-is (empty where the schema is silent).
+        """
+        return build_labels_from_schema(
+            self.schema, self._inherited_colors(labeling_config))
+
+    def _inherited_colors(self, labeling_config: dict | None) -> dict:
+        """Fallback ``label name → colour`` inherited from IDAH source labels."""
+        if not labeling_config:
+            return {}
+        source = _category_colors(labeling_config)
+        chosen: dict[str, str] = {}
+        for category in sorted(self.mapping):
+            label = self.mapping[category].get("label")
+            if label in chosen:
+                continue
+            color = source.get(category, "")
+            if color:
+                chosen[label] = color
+        return chosen
+
+    def resolve(self, annotation: dict) -> tuple[str, dict]:
+        category = (annotation or {}).get("category", "")
+        entry = self.mapping.get(category)
+        if entry is None:
+            return category, {}
+        label = entry["label"]
+        source = annotation.get("attributes") or {}
+        source = ({k.lower(): v for k, v in source.items()}
+                  if isinstance(source, dict) else {})
+        attrs: dict[str, str] = {}
+        for a in self._by_name.get(label, {}).get("attributes", []):
+            name = a["name"]
+            if a.get("input_type") == "checkbox":
+                attrs[name] = _checkbox_value(source.get(name.lower()),
+                                              str(a.get("default_value", "false")))
+            elif name in entry:
+                attrs[name] = str(entry[name])
+        return label, attrs
+
+
+def load_label_mapper(schema_path: str | None,
+                      map_path: str | None) -> LabelMapper | None:
+    """Load a :class:`LabelMapper` from the two JSON files, or ``None``.
+
+    ``None`` (both paths unset) keeps the default verbatim-label behaviour. The
+    two must be given together. Every label the map targets must exist in the
+    schema, and every ``L2``/``L3``/``L4`` value must be one the schema declares
+    for that label — the same up-front check the config scaffolding runs — so a
+    typo fails loudly here instead of producing a package CVAT rejects on upload.
+    """
+    if schema_path is None and map_path is None:
+        return None
+    if schema_path is None or map_path is None:
+        raise SystemExit("--label-schema and --label-map must be given together")
+
+    schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
+    mapping = json.loads(Path(map_path).read_text(encoding="utf-8"))
+    _validate_label_config(schema, mapping)
+    return LabelMapper(schema, mapping)
+
+
+def _validate_label_config(schema: list, mapping: dict) -> None:
+    """Raise if the map references a label/value the schema does not declare."""
+    allowed: dict[str, dict[str, set]] = {}
+    for lab in schema:
+        allowed[lab["name"]] = {a["name"]: set(a.get("values", []))
+                                for a in lab.get("attributes", [])}
+    problems: list[str] = []
+    for category, entry in mapping.items():
+        label = entry.get("label")
+        if label not in allowed:
+            problems.append(f"{category!r}: label {label!r} not in schema")
+            continue
+        for attr in ("L2", "L3", "L4"):
+            if attr in entry and attr in allowed[label] \
+                    and entry[attr] not in allowed[label][attr]:
+                problems.append(f"{category!r}: {label}.{attr}={entry[attr]!r} "
+                                f"not an allowed value")
+    if problems:
+        raise SystemExit("invalid label map:\n  " + "\n  ".join(problems))
 
 
 def _now() -> str:
@@ -709,12 +962,13 @@ def _rotation_attr(rot: float) -> str:
 
 
 def _box_xml(frame: int, box: tuple, *, keyframe: int, outside: int,
-             occluded: int = 0) -> str:
+             occluded: int = 0, attrs: str = "") -> str:
     xtl, ytl, xbr, ybr, rot = box
     rot_attr = _rotation_attr(rot)
     return (f'    <box frame="{frame}" keyframe="{keyframe}" outside="{outside}" '
             f'occluded="{occluded}" xtl="{xtl:.2f}" ytl="{ytl:.2f}" '
-            f'xbr="{xbr:.2f}" ybr="{ybr:.2f}"{rot_attr} z_order="0">\n    </box>')
+            f'xbr="{xbr:.2f}" ybr="{ybr:.2f}"{rot_attr} z_order="0">'
+            f'{attrs}\n    </box>')
 
 
 def _bbox_track_shapes(seq: list, w: int, h: int, *, clamp: bool) -> list:
@@ -866,7 +1120,7 @@ def _group_annotations(annotations: list, *, where: str = "") -> list[list]:
 
 
 def _segment_shapes(suffix: str, seq: list, w: int, h: int, *, clamp: bool,
-                    occluded: int) -> tuple[list[str], tuple]:
+                    occluded: int, attrs: str = "") -> tuple[list[str], tuple]:
     """The shapes for one contiguous segment, plus its final geometry.
 
     The ``keyframe=`` flag differs per shape type, because CVAT stores only
@@ -888,18 +1142,18 @@ def _segment_shapes(suffix: str, seq: list, w: int, h: int, *, clamp: bool,
     if suffix == interp.BBOX:
         emitted = _bbox_track_shapes(seq, w, h, clamp=clamp)
         shapes = [_box_xml(frame, box, keyframe=keyframe, outside=0,
-                           occluded=occluded)
+                           occluded=occluded, attrs=attrs)
                   for (frame, *_), (keyframe, box) in zip(seq, emitted)]
         return shapes, emitted[-1][1]
 
     shapes = [_frame_shape(suffix, frame, points, w, h, keyframe=1, outside=0,
-                           angle=angle, clamp=clamp, occluded=occluded)
+                           angle=angle, clamp=clamp, occluded=occluded, attrs=attrs)
               for frame, points, angle, _is_kf in seq]
     return shapes, (seq[-1][1], seq[-1][2])
 
 
 def _outside_shape(suffix: str, frame: int, tail: tuple, w: int, h: int, *,
-                   clamp: bool, occluded: int) -> str:
+                   clamp: bool, occluded: int, attrs: str = "") -> str:
     """An ``outside="1"`` shape marking the object as gone from ``frame`` on.
 
     CVAT shapes persist forward until the next one overrides them, so a track
@@ -908,14 +1162,16 @@ def _outside_shape(suffix: str, frame: int, tail: tuple, w: int, h: int, *,
     coordinates but never draws them — and it is a keyframe so import keeps it.
     """
     if suffix == interp.BBOX:
-        return _box_xml(frame, tail, keyframe=1, outside=1, occluded=occluded)
+        return _box_xml(frame, tail, keyframe=1, outside=1, occluded=occluded,
+                        attrs=attrs)
     return _frame_shape(suffix, frame, tail[0], w, h, keyframe=1, outside=1,
-                        angle=tail[1], clamp=clamp, occluded=occluded)
+                        angle=tail[1], clamp=clamp, occluded=occluded, attrs=attrs)
 
 
 def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
                      clamp: bool = True, track_id_start: int = 0,
-                     extra_attrs: str = "", where: str = "") -> str:
+                     extra_attrs: str = "", where: str = "",
+                     mapper: LabelMapper | None = None) -> str:
     """Build the <track> body for one video from its annotations.
 
     Annotation rows are first reassembled into tracks by ``Group-Id`` *and*
@@ -935,8 +1191,11 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
     The track ``label=`` is the ``category`` shared by its rows (the IDAH
     tree-path *id*, e.g. ``"vehicles/truck"``), used verbatim so it matches the
     ``id``-keyed ``<labels>`` block — CVAT rejects tracks whose label is not
-    declared. Occlusion, by contrast, is per *segment*, since each row carries
-    its own.
+    declared. With a ``mapper`` it is instead the client label the category maps
+    to, and every shape of the track carries the mapped ``L2``/``L3``/``L4`` (and
+    checkbox) attributes as ``<attribute>`` children — constant across the track,
+    since they are immutable. Occlusion, by contrast, is per *segment*, since each
+    row carries its own.
 
     ``track_id_start`` and ``extra_attrs`` exist for the project level, where
     track ids must stay unique across every task in the project and each track
@@ -961,6 +1220,7 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
     for group in _group_annotations(annotations, where=where):
         shapes: list[str] = []
         suffix = label = None
+        attrs_xml = ""
         prev_end = prev_tail = prev_occluded = None
 
         for ann in group:
@@ -978,7 +1238,12 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
                 continue
 
             if suffix is None:
-                suffix, label = current, ann.annotation.get("category", "")
+                suffix = current
+                if mapper is None:
+                    label = ann.annotation.get("category", "")
+                else:
+                    label, attrs = mapper.resolve(ann.annotation)
+                    attrs_xml = _shape_attrs_xml(attrs)
             elif current != suffix:
                 # One track is one shape type; a mixed group cannot be expressed.
                 _warn(where, f"annotation {_row_id(ann)}: {ann.shape_type!r} in "
@@ -1009,10 +1274,11 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
             if prev_end is not None and start > prev_end + 1:
                 shapes.append(_outside_shape(suffix, prev_end + 1, prev_tail,
                                              w, h, clamp=clamp,
-                                             occluded=prev_occluded))
+                                             occluded=prev_occluded,
+                                             attrs=attrs_xml))
 
             segment, tail = _segment_shapes(suffix, seq, w, h, clamp=clamp,
-                                            occluded=occluded)
+                                            occluded=occluded, attrs=attrs_xml)
             shapes += segment
             prev_end, prev_tail, prev_occluded = end, tail, occluded
 
@@ -1023,7 +1289,8 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
         # the last video frame — there would be no frame to put the marker on.
         if prev_end + 1 <= n_frames - 1:
             shapes.append(_outside_shape(suffix, prev_end + 1, prev_tail, w, h,
-                                         clamp=clamp, occluded=prev_occluded))
+                                         clamp=clamp, occluded=prev_occluded,
+                                         attrs=attrs_xml))
 
         blocks.append(
             f'  <track id="{track_id}" label={quoteattr(label)} '
@@ -1038,7 +1305,7 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
 
 def _frame_shape(suffix: str, frame: int, points: list, w: int, h: int, *,
                  keyframe: int, outside: int, angle: float = 0.0,
-                 clamp: bool = True, occluded: int = 0) -> str:
+                 clamp: bool = True, occluded: int = 0, attrs: str = "") -> str:
     common = (f'frame="{frame}" keyframe="{keyframe}" outside="{outside}" '
               f'occluded="{occluded}"')
 
@@ -1047,11 +1314,11 @@ def _frame_shape(suffix: str, frame: int, points: list, w: int, h: int, *,
         rot_attr = _rotation_attr(rot)
         return (f'    <box {common} '
                 f'xtl="{xtl:.2f}" ytl="{ytl:.2f}" xbr="{xbr:.2f}" ybr="{ybr:.2f}"'
-                f'{rot_attr} z_order="0">\n    </box>')
+                f'{rot_attr} z_order="0">{attrs}\n    </box>')
 
     # polygon
     pts = polygon_to_cvat(points, w, h, clamp=clamp, closed=True)
-    return (f'    <polygon {common} points="{pts}" z_order="0">\n'
+    return (f'    <polygon {common} points="{pts}" z_order="0">{attrs}\n'
             f'    </polygon>')
 
 
@@ -1081,23 +1348,31 @@ def build_meta_images(*, task_id: int, name: str, size: int, labels_xml: str) ->
 
 def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str, *,
                  clamp: bool = True, occluded: int = 0, where: str = "",
-                 ann_id: str = "?") -> str | None:
-    """One CVAT image-format shape element, or None for unsupported types."""
+                 ann_id: str = "?", attrs: str = "") -> str | None:
+    """One CVAT image-format shape element, or None for unsupported types.
+
+    Image shapes self-close when they carry no attributes (``<box .../>``); with
+    a mapper's ``attrs`` they open a body for the ``<attribute>`` children and
+    close on their own line, matching CVAT's format for both cases.
+    """
     common = f'label={quoteattr(label)} source="manual" occluded="{occluded}"'
     points = shape_args.get("points", [])
+    close = lambda tag: f"{attrs}\n    </{tag}>" if attrs else f"</{tag}>"
 
     if suffix == "bounding-box":
         xtl, ytl, xbr, ybr, rot = bbox_to_cvat(points, shape_args.get("angle", 0), w, h, clamp=clamp)
         rot_attr = _rotation_attr(rot)
         return (f'    <box {common} '
                 f'xtl="{xtl:.2f}" ytl="{ytl:.2f}" xbr="{xbr:.2f}" ybr="{ybr:.2f}"'
-                f'{rot_attr} z_order="0"></box>')
+                f'{rot_attr} z_order="0">{close("box")}')
 
     if suffix == "polygon":
-        return f'    <polygon {common} points="{polygon_to_cvat(points, w, h, clamp=clamp, closed=True)}" z_order="0"></polygon>'
+        return (f'    <polygon {common} points="{polygon_to_cvat(points, w, h, clamp=clamp, closed=True)}" '
+                f'z_order="0">{close("polygon")}')
 
     if suffix == "line":   # IDAH line → CVAT polyline (CVAT has no "line")
-        return f'    <polyline {common} points="{polygon_to_cvat(points, w, h, clamp=clamp)}" z_order="0"></polyline>'
+        return (f'    <polyline {common} points="{polygon_to_cvat(points, w, h, clamp=clamp)}" '
+                f'z_order="0">{close("polyline")}')
 
     if suffix in ("ellipse", "circle"):
         # points = [[cx, cy], [rx, ry]] (normalised); circle has rx == ry.
@@ -1106,7 +1381,7 @@ def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str, *,
         rot_attr = _rotation_attr(rot)
         return (f'    <ellipse {common} '
                 f'cx="{cx * w:.2f}" cy="{cy * h:.2f}" rx="{rx * w:.2f}" ry="{ry * h:.2f}"'
-                f'{rot_attr} z_order="0"></ellipse>')
+                f'{rot_attr} z_order="0">{close("ellipse")}')
 
     _warn(where, f"annotation {ann_id}: unsupported shape_type suffix "
                  f"{suffix!r} — skipped")
@@ -1114,24 +1389,30 @@ def _image_shape(suffix: str, shape_args: dict, w: int, h: int, label: str, *,
 
 
 def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True,
-                     where: str = "") -> str:
+                     where: str = "", mapper: LabelMapper | None = None) -> str:
     """Shape elements for one image (CVAT image format).
 
     The shape ``label=`` is the annotation ``category`` (the IDAH tree-path
     *id*) verbatim, matching the ``id``-keyed ``<labels>`` block, and
     ``occluded=`` comes from the IDAH occlusion attribute (see
-    :func:`is_occluded`).
+    :func:`is_occluded`). With a ``mapper`` the label is the client label the
+    category maps to and the shape carries its ``L2``/``L3``/``L4`` (and checkbox)
+    ``<attribute>`` children.
 
     ``where`` only labels the warnings, naming the image being converted.
     """
     out: list[str] = []
     for ann in annotations:
         suffix = _shape_suffix(ann.shape_type)
-        label = ann.annotation.get("category", "")
+        if mapper is None:
+            label, attrs_xml = ann.annotation.get("category", ""), ""
+        else:
+            label, attrs = mapper.resolve(ann.annotation)
+            attrs_xml = _shape_attrs_xml(attrs)
         _check_occlusion(ann, where=where)
         el = _image_shape(suffix, ann.shape_args, w, h, label, clamp=clamp,
                           occluded=int(is_occluded(ann.annotation)),
-                          where=where, ann_id=_row_id(ann))
+                          where=where, ann_id=_row_id(ann), attrs=attrs_xml)
         if el is not None:
             out.append(el)
     return "\n".join(out)
@@ -1241,7 +1522,8 @@ def _entry_folder(entry) -> str:
 
 def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
                        with_images: bool, clamp: bool = True,
-                       level: str = TASK) -> None:
+                       level: str = TASK,
+                       mapper: LabelMapper | None = None) -> None:
     """Export one idah-video entry as a task-level or job-level CVAT package.
 
     Both levels describe the same single video with the same 0-based frame
@@ -1255,7 +1537,9 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
         name = _entry_name(entry)
         width, height, n_frames = probe_video(media_path)
 
-        labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
+        labels_xml = (mapper.labels_xml(ds.metadata.get("Labeling-Configuration", {}))
+                      if mapper
+                      else build_labels(ds.metadata.get("Labeling-Configuration", {})))
         if level == JOB:
             meta = build_meta_job(job_id=task_id, size=n_frames,
                                   labels_xml=labels_xml, mode="interpolation",
@@ -1270,9 +1554,11 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
         # repeating the entry name on every warning line drowns them out.
         rows = list(upd.annotations.for_entry(entry.id))
         print(f"  [{name}] {width}x{height}, {n_frames} frames, {len(rows)} rows")
-        undeclared = check_categories(
-            rows, label_ids(ds.metadata.get("Labeling-Configuration", {})))
-        body = write_video_body(rows, width, height, n_frames, clamp=clamp)
+        declared = (mapper.declared if mapper
+                    else label_ids(ds.metadata.get("Labeling-Configuration", {})))
+        undeclared = check_categories(rows, declared)
+        body = write_video_body(rows, width, height, n_frames, clamp=clamp,
+                                mapper=mapper)
 
         folder = _entry_folder(entry)
         if level == JOB:
@@ -1296,7 +1582,8 @@ def export_video_entry(upd, ds, entry, out_dir: Path, *, task_id: int,
 def export_video_project(upd, ds, entries: list, out_dir: Path, *,
                          project_id: int, with_images: bool,
                          clamp: bool = True,
-                         part: tuple[int, int] | None = None) -> None:
+                         part: tuple[int, int] | None = None,
+                         mapper: LabelMapper | None = None) -> None:
     """Export a whole idah-video dataset as one project-level CVAT package.
 
     Every entry becomes a ``<task>`` inside ``<meta><project><tasks>`` *and* its
@@ -1318,8 +1605,11 @@ def export_video_project(upd, ds, entries: list, out_dir: Path, *,
     independent CVAT project whose task ids, subsets and track ids are numbered
     within itself.
     """
-    labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
-    declared = label_ids(ds.metadata.get("Labeling-Configuration", {}))
+    labels_xml = (mapper.labels_xml(ds.metadata.get("Labeling-Configuration", {}))
+                  if mapper
+                  else build_labels(ds.metadata.get("Labeling-Configuration", {})))
+    declared = (mapper.declared if mapper
+                else label_ids(ds.metadata.get("Labeling-Configuration", {})))
     part_suffix = _part_suffix(part)
     project_dir = out_dir / f"project_{_safe_name(ds.name)}{part_suffix}"
 
@@ -1358,6 +1648,7 @@ def export_video_project(upd, ds, entries: list, out_dir: Path, *,
                 rows, width, height, n_frames,
                 clamp=clamp, track_id_start=track_id,
                 extra_attrs=f' task_id="{task_id}" subset={quoteattr(subset)}',
+                mapper=mapper,
             )
             n_tracks = body.count("<track ")
             if body:
@@ -1391,7 +1682,8 @@ def export_video_project(upd, ds, entries: list, out_dir: Path, *,
 def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
                          with_images: bool, clamp: bool = True,
                          level: str = TASK, entries: list | None = None,
-                         part: tuple[int, int] | None = None) -> None:
+                         part: tuple[int, int] | None = None,
+                         mapper: LabelMapper | None = None) -> None:
     """Export an idah-image dataset to a CVAT 'for images 1.1' package.
 
     An image dataset is a *single* CVAT task whatever the level — all entries
@@ -1405,7 +1697,9 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
     the package — each part is a complete CVAT project of its own, with its
     images renumbered from 0.
     """
-    labels_xml = build_labels(ds.metadata.get("Labeling-Configuration", {}))
+    labels_xml = (mapper.labels_xml(ds.metadata.get("Labeling-Configuration", {}))
+                  if mapper
+                  else build_labels(ds.metadata.get("Labeling-Configuration", {})))
     part_suffix = _part_suffix(part)
 
     if entries is None:
@@ -1427,7 +1721,8 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
     blocks: list[str] = []
     seen_names: set[str] = set()
     undeclared: dict = {}
-    declared = label_ids(ds.metadata.get("Labeling-Configuration", {}))
+    declared = (mapper.declared if mapper
+                else label_ids(ds.metadata.get("Labeling-Configuration", {})))
     n_shapes = 0
 
     for img_id, entry in enumerate(entries):
@@ -1452,7 +1747,7 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
                                               where=name).items():
             undeclared.setdefault(category, []).extend(bad)
         body = write_image_body(annotations, width, height, clamp=clamp,
-                                where=name)
+                                where=name, mapper=mapper)
         n_dropped = len(annotations) - body.count("\n") - bool(body)
         if n_dropped:
             print(f"  ! [{name}] {n_dropped} of {len(annotations)} annotations "
@@ -1493,13 +1788,21 @@ def export_image_dataset(upd, ds, out_dir: Path, *, task_id: int,
 
 def run(upd_path: str, output: str, *, with_images: bool = False,
         dataset_id: str | None = None, entry_id: str | None = None,
-        clamp: bool = True, split: int | None = None) -> None:
+        clamp: bool = True, split: int | None = None,
+        label_schema: str | None = None, label_map: str | None = None) -> None:
     """Export the datasets in ``upd_path`` to CVAT packages under ``output``.
 
     The *level* of the export follows the filters — see :func:`level_for`. With
     no filter every dataset is dumped as a CVAT project; ``dataset_id`` narrows
     to one dataset and drops to task level; ``entry_id`` narrows to one entry
     and drops to job level.
+
+    ``label_schema``/``label_map`` (given together) switch on hierarchical
+    labels: instead of the IDAH tree-path as a flat label name, the client
+    schema's labels are emitted and each shape is tagged with the mapped
+    ``L2``/``L3``/``L4`` (and checkbox) attributes. See :func:`load_label_mapper`.
+    The same mapper applies to every dataset in the file, so run one dataset at a
+    time (``--dataset-id``) when their taxonomies differ.
 
     ``clamp`` (default) clips every shape to the image/frame bounds so no point
     lands outside the media — IDAH normalised points can drift outside
@@ -1514,6 +1817,7 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
     """
     out_dir = Path(output)
     level = level_for(dataset_id, entry_id)
+    mapper = load_label_mapper(label_schema, label_map)
 
     if split and level != PROJECT:
         print(f"  ! --split is ignored at {level} level "
@@ -1560,7 +1864,8 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
                         print(f"  part {part[0]}/{part[1]} — {len(chunk)} entries")
                     export_image_dataset(upd, ds, out_dir, task_id=unit_id,
                                          with_images=with_images, clamp=clamp,
-                                         level=level, entries=chunk, part=part)
+                                         level=level, entries=chunk, part=part,
+                                         mapper=mapper)
                     unit_id += 1
                 continue
 
@@ -1571,14 +1876,14 @@ def run(upd_path: str, output: str, *, with_images: bool = False,
                     export_video_project(upd, ds, chunk, out_dir,
                                          project_id=unit_id,
                                          with_images=with_images, clamp=clamp,
-                                         part=part)
+                                         part=part, mapper=mapper)
                     unit_id += 1
                 continue
 
             for entry in entries:
                 export_video_entry(upd, ds, entry, out_dir, task_id=unit_id,
                                    with_images=with_images, clamp=clamp,
-                                   level=level)
+                                   level=level, mapper=mapper)
                 unit_id += 1
 
         if entry_id and not exported:

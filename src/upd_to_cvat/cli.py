@@ -38,6 +38,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "smaller batches instead of one huge one. Ignored at "
                         "task/job level, which already write one package per "
                         "entry.")
+    p.add_argument("--label-schema", dest="label_schema", default=None,
+                   metavar="PATH",
+                   help="JSON file with the client's CVAT label schema (labels "
+                        "with L2/L3/L4 and checkbox attributes). With "
+                        "--label-map, switches on hierarchical labels: shapes "
+                        "carry attribute values instead of a flat tree-path "
+                        "label. Must be given together with --label-map.")
+    p.add_argument("--label-map", dest="label_map", default=None,
+                   metavar="PATH",
+                   help="JSON file mapping each IDAH category (tree-path id) to "
+                        "its {label, L2, L3, L4}. Must be given together with "
+                        "--label-schema.")
     return p
 
 
@@ -56,7 +68,8 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     run(args.upd, args.output,
         with_images=args.with_images, dataset_id=args.dataset_id,
-        entry_id=args.entry_id, clamp=args.clamp, split=args.split)
+        entry_id=args.entry_id, clamp=args.clamp, split=args.split,
+        label_schema=args.label_schema, label_map=args.label_map)
 
 
 if __name__ == "__main__":

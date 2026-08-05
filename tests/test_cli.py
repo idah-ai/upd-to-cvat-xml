@@ -57,10 +57,10 @@ def test_main_delegates_to_run(monkeypatch):
     calls = {}
 
     def fake_run(upd_path, output, *, with_images, dataset_id, entry_id, clamp,
-                 split):
+                 split, label_schema, label_map):
         calls.update(upd_path=upd_path, output=output, with_images=with_images,
                      dataset_id=dataset_id, entry_id=entry_id, clamp=clamp,
-                     split=split)
+                     split=split, label_schema=label_schema, label_map=label_map)
 
     monkeypatch.setattr(cli, "run", fake_run)
     cli.main(["--upd", "in.upd", "--output", "out", "--with-images",
@@ -68,4 +68,5 @@ def test_main_delegates_to_run(monkeypatch):
     assert calls == {
         "upd_path": "in.upd", "output": "out", "with_images": True,
         "dataset_id": "d1", "entry_id": None, "clamp": False, "split": 10,
+        "label_schema": None, "label_map": None,
     }

@@ -1,0 +1,6 @@
+# Client-specific label configs are not version-controlled — they hold a
+# client's taxonomy and are regenerated per project (see README.md).
+# The README, this file, and the *.example.json pair stay tracked; the real
+# label_schema.json / label_map.json do not.
+label_schema.json
+label_map.json

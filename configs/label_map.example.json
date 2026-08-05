@@ -1,0 +1,7 @@
+{
+  "vehicle/civilian/car/suv":    { "label": "vehicle_civilian", "L2": "civilian", "L3": "car", "L4": "suv" },
+  "vehicle/civilian/car/pickup": { "label": "vehicle_civilian", "L2": "civilian", "L3": "car", "L4": "pickUp" },
+  "vehicle/civilian/truck":      { "label": "vehicle_civilian", "L2": "civilian", "L3": "truck", "L4": "-" },
+  "vehicle/civilian/crane":      { "label": "vehicle_construction", "L2": "civilian", "L3": "crane", "L4": "-" },
+  "vehicle/civilian/excavator":  { "label": "vehicle_construction", "L2": "civilian", "L3": "excavator", "L4": "-" }
+}

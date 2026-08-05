@@ -1,0 +1,64 @@
+[
+  {
+    "name": "vehicle_civilian",
+    "color": "#37e9cb",
+    "type": "any",
+    "attributes": [
+      {
+        "name": "L2",
+        "input_type": "select",
+        "mutable": false,
+        "values": ["civilian", "other"],
+        "default_value": "civilian"
+      },
+      {
+        "name": "L3",
+        "input_type": "select",
+        "mutable": false,
+        "values": ["-", "car", "truck"],
+        "default_value": "-"
+      },
+      {
+        "name": "L4",
+        "input_type": "select",
+        "mutable": false,
+        "values": ["-", "suv", "pickUp"],
+        "default_value": "-"
+      },
+      {
+        "name": "camouflaged",
+        "input_type": "checkbox",
+        "mutable": false,
+        "values": ["false"],
+        "default_value": "false"
+      }
+    ]
+  },
+  {
+    "name": "vehicle_construction",
+    "type": "any",
+    "attributes": [
+      {
+        "name": "L2",
+        "input_type": "select",
+        "mutable": false,
+        "values": ["civilian"],
+        "default_value": "civilian"
+      },
+      {
+        "name": "L3",
+        "input_type": "select",
+        "mutable": false,
+        "values": ["crane", "excavator"],
+        "default_value": "crane"
+      },
+      {
+        "name": "L4",
+        "input_type": "select",
+        "mutable": false,
+        "values": ["-"],
+        "default_value": "-"
+      }
+    ]
+  }
+]
