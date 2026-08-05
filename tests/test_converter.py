@@ -257,13 +257,17 @@ def _bbox_track_args():
     ]}
 
 
-def test_write_video_body_materialises_every_frame_as_keyframe():
+def test_write_video_body_materialises_every_frame():
     ann = make_ann("idah-video:bounding-box", _bbox_track_args())
     body = c.write_video_body([ann], 100, 100, n_frames=10)
     assert body.count("<track ") == 1
     # frames 0,1,2 + one terminating outside shape at frame 3
     assert body.count("<box ") == 4
-    assert body.count('keyframe="0"') == 0            # every shape is a keyframe
+    # bbox anchors (frames 0, 2) + the outside terminator are keyframes; the
+    # materialised in-between (frame 1) is keyframe="0" so CVAT re-interpolates
+    # it from the anchors on import (see _segment_shapes docstring).
+    assert body.count('keyframe="1"') == 3
+    assert body.count('keyframe="0"') == 1
     assert 'label="veh/car"' in body
 
 

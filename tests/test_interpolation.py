@@ -149,14 +149,14 @@ def test_shape_at_polygon_midpoint_between_scaled_triangles():
 
 def test_iter_frames_covers_every_integer_frame_inclusive():
     sa = bbox_args((0, [[0, 0], [1, 1]]), (4, [[0, 0], [2, 2]]))
-    frames = [f for f, _, _ in interp.iter_frames(sa, kind=interp.BBOX)]
+    frames = [f for f, *_ in interp.iter_frames(sa, kind=interp.BBOX)]
     assert frames == [0, 1, 2, 3, 4]
 
 
 def test_iter_frames_matches_shape_at_pointwise():
     sa = bbox_args((0, [[0.0, 0.0], [1.0, 1.0]]),
                    (8, [[0.0, 0.0], [3.0, 3.0]]))
-    for frame, points, angle in interp.iter_frames(sa, kind=interp.BBOX):
+    for frame, points, angle, _is_kf in interp.iter_frames(sa, kind=interp.BBOX):
         exp_pts, exp_angle = interp.shape_at(sa, frame, kind=interp.BBOX)
         assert np.allclose(points, exp_pts)
         assert angle == pytest.approx(exp_angle)
@@ -166,7 +166,7 @@ def test_iter_frames_pre_and_post_roll_hold_edge_keyframes():
     sa = bbox_args((3, [[0, 0], [1, 1]]), (6, [[0, 0], [2, 2]]),
                    start=1, end=8)
     out = list(interp.iter_frames(sa, kind=interp.BBOX))
-    frames = [f for f, _, _ in out]
+    frames = [f for f, *_ in out]
     assert frames == [1, 2, 3, 4, 5, 6, 7, 8]
     # pre-roll holds the first keyframe
     assert out[0][1] == [[0, 0], [1, 1]]
@@ -178,7 +178,7 @@ def test_iter_frames_reuses_edge_points_object_identity_not_required():
     # sanity: single-keyframe track yields exactly that one frame
     sa = bbox_args((5, [[0, 0], [1, 1]]))
     out = list(interp.iter_frames(sa, kind=interp.BBOX))
-    assert [f for f, _, _ in out] == [5]
+    assert [f for f, *_ in out] == [5]
 
 
 # ---------------------------------------------------------------------------
