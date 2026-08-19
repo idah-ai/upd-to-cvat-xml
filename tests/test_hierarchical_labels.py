@@ -20,10 +20,11 @@ def make_ann(shape_type, shape_args, category, attributes=None):
     ann = SimpleNamespace(
         shape_type=shape_type,
         shape_args=shape_args,
-        annotation={"category": category},
+        category=category,
+        properties={},
     )
     if attributes is not None:
-        ann.annotation["attributes"] = attributes
+        ann.properties.update(attributes)
     return ann
 
 
@@ -156,7 +157,7 @@ def test_checkbox_value(raw, expected):
 # ---------------------------------------------------------------------------
 
 def test_resolve_maps_category_to_label_and_select_attrs():
-    label, attrs = mapper().resolve({"category": "vehicle/civilian/car/suv"})
+    label, attrs = mapper().resolve("vehicle/civilian/car/suv", {})
     assert label == "vehicle_civilian"
     assert attrs["L2"] == "civilian"
     assert attrs["L3"] == "car"
@@ -164,24 +165,24 @@ def test_resolve_maps_category_to_label_and_select_attrs():
 
 
 def test_resolve_defaults_checkbox_when_absent_from_idah():
-    _, attrs = mapper().resolve({"category": "vehicle/civilian/car/suv"})
+    _, attrs = mapper().resolve("vehicle/civilian/car/suv", {})
     assert attrs["camouflaged"] == "false"
 
 
 def test_resolve_reads_checkbox_from_idah_attributes_case_insensitively():
-    _, attrs = mapper().resolve({"category": "vehicle/civilian/car/suv",
-                                 "attributes": {"Camouflaged": True}})
+    _, attrs = mapper().resolve("vehicle/civilian/car/suv",
+                                {"Camouflaged": True})
     assert attrs["camouflaged"] == "true"
 
 
 def test_resolve_attribute_order_follows_schema():
-    _, attrs = mapper().resolve({"category": "vehicle/civilian/car/suv"})
+    _, attrs = mapper().resolve("vehicle/civilian/car/suv", {})
     assert list(attrs) == ["L2", "L3", "L4", "camouflaged"]
 
 
 def test_resolve_unknown_category_passes_through_with_no_attrs():
     # Left for check_categories to report / CVAT to reject — never dropped.
-    label, attrs = mapper().resolve({"category": "vehicle/unmapped"})
+    label, attrs = mapper().resolve("vehicle/unmapped", {})
     assert label == "vehicle/unmapped"
     assert attrs == {}
 

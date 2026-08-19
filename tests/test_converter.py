@@ -23,7 +23,8 @@ def make_ann(shape_type, shape_args, category="veh/car"):
     return SimpleNamespace(
         shape_type=shape_type,
         shape_args=shape_args,
-        annotation={"category": category},
+        category=category,
+        properties={},
     )
 
 
@@ -504,24 +505,23 @@ def test_task_block_carries_its_own_subset():
     (None, False),
 ])
 def test_is_occluded_handles_every_stored_value_shape(value, expected):
-    assert c.is_occluded({"attributes": {"occlusion": value}}) is expected
+    assert c.is_occluded({"occlusion": value}) is expected
 
 
-@pytest.mark.parametrize("annotation", [
-    {},                                  # no attributes at all
-    {"attributes": {}},                  # attributes present but empty
-    {"attributes": None},                # attributes explicitly null
-    {"attributes": {"other": "x"}},      # unrelated attribute only
-    {"category": "human/civilian/undefined"},
+@pytest.mark.parametrize("properties", [
+    {},                                  # no properties at all
+    {"occlusion": ""},                  # occlusion present but blank
+    {"occlusion": None},                # occlusion explicitly null
+    {"other": "x"},                    # unrelated property only
     None,
 ])
-def test_is_occluded_defaults_to_false(annotation):
-    assert c.is_occluded(annotation) is False
+def test_is_occluded_defaults_to_false(properties):
+    assert c.is_occluded(properties) is False
 
 
 def test_write_video_body_marks_every_frame_of_an_occluded_track():
     ann = make_ann("idah-video:bounding-box", _bbox_track_args())
-    ann.annotation["attributes"] = {"occlusion": "Partial"}
+    ann.properties["occlusion"] = "Partial"
     body = c.write_video_body([ann], 100, 100, n_frames=10)
     # Occlusion is a track-level property: it holds for every emitted shape,
     # including the outside="1" terminator.
@@ -537,7 +537,7 @@ def test_write_video_body_unoccluded_track_stays_zero():
 
 def test_write_video_body_occlusion_is_per_track_not_global():
     a = make_ann("idah-video:bounding-box", _bbox_track_args(), category="a")
-    a.annotation["attributes"] = {"occlusion": "FULL"}
+    a.properties["occlusion"] = "FULL"
     b = make_ann("idah-video:bounding-box", _bbox_track_args(), category="b")
     body = c.write_video_body([a, b], 100, 100, n_frames=10)
 
@@ -549,7 +549,7 @@ def test_write_video_body_occlusion_is_per_track_not_global():
 def test_write_image_body_carries_occlusion_onto_the_shape():
     ann = make_ann("idah-image:bounding-box",
                    {"points": [[0.1, 0.1], [0.5, 0.5]]}, category="veh/truck")
-    ann.annotation["attributes"] = {"occlusion": "FULL"}
+    ann.properties["occlusion"] = "FULL"
     assert 'occluded="1"' in c.write_image_body([ann], 100, 100)
 
 
@@ -654,11 +654,12 @@ def make_seg(start, end, group=None, category="veh/car", occlusion=None,
             {"frame": start, "points": [[0.0, 0.0], [0.5, 0.5]]},
             {"frame": end, "points": [[0.0, 0.0], [0.6, 0.6]]},
         ]},
-        annotation={"category": category},
+        category=category,
+        properties={},
         metadata={"Group-Id": group} if group else {},
     )
     if occlusion is not None:
-        ann.annotation["attributes"] = {"occlusion": occlusion}
+        ann.properties["occlusion"] = occlusion
     return ann
 
 
