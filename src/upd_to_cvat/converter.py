@@ -236,7 +236,7 @@ def check_categories(annotations: list, declared: set[str], *,
         return {}                    # no taxonomy to check against
     bad: dict = {}
     for ann in annotations:
-        category = ann.annotation.get("category", "")
+        category = ann.category
         if category not in declared:
             bad.setdefault(category, []).append(ann)
     for category, rows in sorted(bad.items()):
@@ -513,15 +513,13 @@ class LabelMapper:
                 chosen[label] = color
         return chosen
 
-    def resolve(self, annotation: dict) -> tuple[str, dict]:
-        category = (annotation or {}).get("category", "")
+    def resolve(self, category: str, properties: dict) -> tuple[str, dict]:
         entry = self.mapping.get(category)
         if entry is None:
             return category, {}
         label = entry["label"]
-        source = annotation.get("attributes") or {}
-        source = ({k.lower(): v for k, v in source.items()}
-                  if isinstance(source, dict) else {})
+        source = ({k.lower(): v for k, v in properties.items()}
+                  if isinstance(properties, dict) else {})
         attrs: dict[str, str] = {}
         for a in self._by_name.get(label, {}).get("attributes", []):
             name = a["name"]
@@ -879,10 +877,10 @@ def _shape_suffix(shape_type: str) -> str:
 OCCLUSION_VALUES = frozenset({"partial", "full"})
 
 
-def is_occluded(annotation: dict) -> bool:
+def is_occluded(properties: dict) -> bool:
     """Whether an IDAH annotation is occluded — CVAT's ``occluded`` flag.
 
-    IDAH stores this as ``annotation.attributes.occlusion``. It is a property of
+    IDAH stores this as ``properties.occlusion``. It is a property of
     the *annotation*, i.e. of the whole track: the per-frame records carry only
     ``frame``/``points``/``angle``, so there is no per-frame occlusion to read
     and every shape of a track inherits the one value. (CVAT does allow it to
@@ -903,13 +901,12 @@ def is_occluded(annotation: dict) -> bool:
     ``outside="1"`` appears only as a track's final terminator.
     """
     return any(str(v).strip().lower() in OCCLUSION_VALUES
-               for v in _occlusion_values(annotation))
+               for v in _occlusion_values(properties))
 
 
-def _occlusion_values(annotation: dict) -> list:
+def _occlusion_values(properties: dict) -> list:
     """The raw ``occlusion`` entries of an annotation, always as a list."""
-    attributes = (annotation or {}).get("attributes") or {}
-    value = attributes.get("occlusion", "") if isinstance(attributes, dict) else ""
+    value = properties.get("occlusion", "") if isinstance(properties, dict) else ""
     return value if isinstance(value, list) else [value]
 
 
@@ -922,7 +919,7 @@ def _check_occlusion(ann, *, where: str = "") -> None:
     the normal "no occlusion recorded" case, and the data holds whitespace-only
     ones (``" "``) that mean the same thing.
     """
-    unknown = sorted({str(v).strip() for v in _occlusion_values(ann.annotation)
+    unknown = sorted({str(v).strip() for v in _occlusion_values(ann.properties)
                       if str(v).strip()
                       and str(v).strip().lower() not in OCCLUSION_VALUES})
     if unknown:
@@ -1103,7 +1100,7 @@ def _group_annotations(annotations: list, *, where: str = "") -> list[list]:
     for i, ann in enumerate(annotations):
         gid = ((getattr(ann, "metadata", None) or {}).get("Group-Id")
                or getattr(ann, "id", None))
-        category = ann.annotation.get("category", "")
+        category = ann.category
         # A group is keyed by (group, category) so mixed-category groups split;
         # a row with neither a Group-Id nor an id can only stand alone.
         key = ("group", gid, category) if gid else ("row", i)
@@ -1240,9 +1237,9 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
             if suffix is None:
                 suffix = current
                 if mapper is None:
-                    label = ann.annotation.get("category", "")
+                    label = ann.category
                 else:
-                    label, attrs = mapper.resolve(ann.annotation)
+                    label, attrs = mapper.resolve(ann.category, ann.properties)
                     attrs_xml = _shape_attrs_xml(attrs)
             elif current != suffix:
                 # One track is one shape type; a mixed group cannot be expressed.
@@ -1259,7 +1256,7 @@ def write_video_body(annotations: list, w: int, h: int, n_frames: int, *,
                 continue
 
             _check_occlusion(ann, where=where)
-            occluded = int(is_occluded(ann.annotation))
+            occluded = int(is_occluded(ann.properties))
             start = sa.get("start", frames[0]["frame"])
             end = sa.get("end", frames[-1]["frame"])
 
@@ -1405,13 +1402,13 @@ def write_image_body(annotations: list, w: int, h: int, *, clamp: bool = True,
     for ann in annotations:
         suffix = _shape_suffix(ann.shape_type)
         if mapper is None:
-            label, attrs_xml = ann.annotation.get("category", ""), ""
+            label, attrs_xml = ann.category, ""
         else:
-            label, attrs = mapper.resolve(ann.annotation)
+            label, attrs = mapper.resolve(ann.category, ann.properties)
             attrs_xml = _shape_attrs_xml(attrs)
         _check_occlusion(ann, where=where)
         el = _image_shape(suffix, ann.shape_args, w, h, label, clamp=clamp,
-                          occluded=int(is_occluded(ann.annotation)),
+                          occluded=int(is_occluded(ann.properties)),
                           where=where, ann_id=_row_id(ann), attrs=attrs_xml)
         if el is not None:
             out.append(el)
